@@ -457,6 +457,31 @@ def get_logs_by_day(date: str, session: Session = Depends(get_session)):
 
     return logs
 
+@app.post("/compartments/{compartment_number}/refill")
+def refill_medicine(compartment_number : int, refill: RefillRequest, session : Session = Depends(get_session)):
+    compartment = session.exec(select(Compartment).where(Compartment.compartment_number==compartment_number)).first()
+
+    if compartment_number not in [1, 2, 3]:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid compartment number. Only 1, 2, or 3 are allowed."
+        )
+    
+    if not compartment:
+        raise HTTPException(status_code=404, detail="Compartment not found")
+    
+    compartment.number_of_medicines += refill.amount  #if i want just the value, can simply remove the +
+    compartment.taken = False
+    compartment.low_stock = compartment.number_of_medicines < 4
+    session.add(compartment)
+    session.commit()
+    session.refresh(compartment)
+
+    return {
+        "message": f"Refilled compartment {compartment_number} with {refill.amount} units.",
+        "current_total": compartment.number_of_medicines
+    }
+
 
 # @app.post("/adafruit-webhook/")
 # def receive_adafruit_data(data: List[AdafruitData], session: Session = Depends(get_session)):
@@ -519,42 +544,6 @@ def get_logs_by_day(date: str, session: Session = Depends(get_session)):
 
 #     return {"message": "No valid compartment found in the received data."}
 
-# @app.post("/compartments/{compartment_number}/refill")
-# def refill_medicine(compartment_number : int, refill: RefillRequest, session : Session = Depends(get_session)):
-#     compartment = session.exec(select(Compartment).where(Compartment.compartment_number==compartment_number)).first()
-
-#     if compartment_number not in [1, 2, 3]:
-#         raise HTTPException(
-#             status_code=400,
-#             detail="Invalid compartment number. Only 1, 2, or 3 are allowed."
-#         )
-    
-#     if not compartment:
-#         raise HTTPException(status_code=404, detail="Compartment not found")
-    
-#     compartment.number_of_medicines += refill.amount  #if i want just the value, can simply remove the +
-#     compartment.taken = False
-#     compartment.low_stock = compartment.number_of_medicines < 4
-#     session.add(compartment)
-#     session.commit()
-#     session.refresh(compartment)
-
-#     where_to_send = ADAFRUIT_FEED_URLS.get(compartment_number)
-    
-#     if where_to_send:
-#         try:
-#             httpx.post(
-#                 where_to_send,
-#                 headers={"X-AIO-Key": ""},
-#                 json={"value": compartment.number_of_medicines}
-#             )
-#         except Exception as e:
-#             print("Failed to update Adafruit:", e)
-
-#     return {
-#         "message": f"Refilled compartment {compartment_number} with {refill.amount} units.",
-#         "current_total": compartment.number_of_medicines
-#     }
 
 # @app.post("/populate-test-data/")
 # def populate_test_data(session: Session = Depends(get_session)):
