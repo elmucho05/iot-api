@@ -1,6 +1,6 @@
 from typing import Optional, List
 from typing import Annotated
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 
 from datetime import time
 from fastapi import FastAPI, HTTPException, Depends, Query, Body
@@ -78,6 +78,15 @@ class AdafruitData(BaseModel):
 
 class RefillRequest(BaseModel):
     amount: int
+
+class MedicineLog(SQLModel, table= True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    compartment_number: int
+    medicine_name: str
+    taken_at: datetime
+    action: str = Field(default="taken")  # can be "taken", "refill", "manual"
+
+
 
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
@@ -362,7 +371,6 @@ def get_pending_medicines(compartment_number: int, session: Session = Depends(ge
 #################################################################
 ###################### Adafruit stuff ###########################
 #################################################################
-
 @app.post("/adafruit-taken-webhook/")
 def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_session)):
     for entry in data:
@@ -390,7 +398,15 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
             comp.taken = True
             comp.taken_at = parser.isoparse(entry.created_at)
             comp.low_stock = comp.number_of_medicines < 4
+            
+            log = MedicineLog(
+                compartment_number=comp.compartment_number,
+                medicine_name=comp.medicine_name,
+                taken_at=comp.taken_at,
+                action="taken"
+            )
 
+            session.add(log)
             session.add(comp)
             session.commit()
             session.refresh(comp)
@@ -402,6 +418,30 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
             }
 
     return {"message": "No valid update processed"}
+
+
+@app.get("/logs/", response_model=List[MedicineLog])
+def get_all_logs(session: Session = Depends(get_session)):
+    return session.exec(select(MedicineLog).order_by(MedicineLog.taken_at.desc())).all()
+
+@app.get("/logs/by-day/{date}", response_model=List[MedicineLog])
+def get_logs_by_day(date: str, session: Session = Depends(get_session)):
+    try:
+        day_start = datetime.fromisoformat(date)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    day_end = day_start + timedelta(days=1)
+
+    logs = session.exec(
+        select(MedicineLog).where(
+            MedicineLog.taken_at >= day_start,
+            MedicineLog.taken_at < day_end
+        ).order_by(MedicineLog.taken_at)
+    ).all()
+
+    return logs
+
 
 # @app.post("/adafruit-webhook/")
 # def receive_adafruit_data(data: List[AdafruitData], session: Session = Depends(get_session)):
