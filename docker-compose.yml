@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    ports:
+      - "8888:8888"
+    volumes:
+      - .:/app
+    environment:
+      - DEBUG=True
+    restart: always  # Ensures the container restarts if it crashes
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run --token eyJhIjoiOGMwYTFhZTUxOTVmZDVmNWUyYzA5ZDBkODgwMTllNjYiLCJ0IjoiOTYzZGRkZjAtMmZlOS00NmExLTk3YmItZmJhNzNiYTg1MDZhIiwicyI6IllUaGlOR1JtTXpZdE1qQmtPUzAwWWpoaExUa3hNemt0WXpBeU1EUTNNRGRsWkRGayJ9
+    restart: always  # Ensures it keeps running even if it crashes
+
+
