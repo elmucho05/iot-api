@@ -2,6 +2,9 @@ from typing import Optional, List
 from typing import Annotated
 from datetime import datetime, time, timedelta
 
+from fastapi.middleware.cors import CORSMiddleware
+
+
 from datetime import time
 from fastapi import FastAPI, HTTPException, Depends, Query, Body
 from sqlmodel import SQLModel, Field, Session, create_engine, select, delete
@@ -100,6 +103,18 @@ def get_session():
 SessionDep = Annotated[Session, Depends(get_session)]
 
 app = FastAPI()
+origins = [
+    "http://localhost",           # per test locali
+    "http://localhost:4200",      # se usi Angular local
+    "https://myapi.smartmeds.it"  # opzionale se vuoi permettere a te stesso richieste interne
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],             # oppure usa ["*"] per test ma NON in produzione
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
