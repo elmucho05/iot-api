@@ -392,7 +392,6 @@ def get_pending_medicines(compartment_number: int, session: Session = Depends(ge
 def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_session)):
     for entry in data:
         feed = entry.feed_name.lower()
-
         feed_map = {
             "comp1-taken": 1,
             "comp2-taken": 2,
@@ -400,40 +399,36 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
         }
         comp_num = feed_map.get(feed)
         if not comp_num:
-            continue  # unknown feed, ignore
+            continue
 
         comp = session.exec(
             select(Compartment).where(Compartment.compartment_number == comp_num)
         ).first()
-
         if not comp:
             continue
 
         if entry.value.strip() == "1":
-            #comp.number_of_medicines -= 1
-            comp.number_of_medicines = max(comp.number_of_medicines-1, 0)  # prevent negatives
+            comp.number_of_medicines = max(comp.number_of_medicines - 1, 0)
             taken_time = parser.isoparse(entry.created_at)
             comp.taken = True
             comp.taken_at = taken_time
             comp.low_stock = comp.number_of_medicines < 4
-            
-            #determinare expected schedule time
+
+            # ⏰ Determine expected scheduled time (very simple for now)
             now = taken_time.time()
             scheduled_times = [comp.morning_time, comp.afternoon_time, comp.evening_time]
             scheduled = next((t for t in scheduled_times if t and abs(datetime.combine(datetime.today(), t) - taken_time).seconds < 3600), None)
             is_late = scheduled is not None and now > scheduled
 
-
             log = MedicineLog(
                 compartment_number=comp.compartment_number,
                 medicine_name=comp.medicine_name,
-                taken_at=comp.taken_at,
+                taken_at=taken_time,
                 action="taken",
                 remaining_pills=comp.number_of_medicines,
                 low_stock=comp.low_stock,
                 scheduled_time=scheduled,
-                is_late = is_late
-
+                is_late=is_late
             )
 
             session.add(log)
@@ -449,8 +444,8 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
                 "is_late": is_late
             }
 
-
     return {"message": "No valid update processed"}
+
 
 
 @app.get("/logs/", response_model=List[MedicineLog])
