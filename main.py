@@ -82,14 +82,16 @@ class AdafruitData(BaseModel):
 class RefillRequest(BaseModel):
     amount: int
 
-class MedicineLog(SQLModel, table= True):
+class MedicineLog(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     compartment_number: int
     medicine_name: str
-    taken_at: datetime
-    action: str = Field(default="taken")  # can be "taken", "refill", "manual"
-
-
+    taken_at: datetime  # This can be time of action (taken/refill/manual)
+    action: str = Field(default="taken")  # "taken", "refill", "manual"
+    remaining_pills: Optional[int] = None
+    low_stock: Optional[bool] = None
+    scheduled_time: Optional[time] = None  # when it was supposed to be taken
+    is_late: Optional[bool] = None
 
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
@@ -408,17 +410,30 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
             continue
 
         if entry.value.strip() == "1":
-            comp.number_of_medicines -= 1
-            comp.number_of_medicines = max(comp.number_of_medicines, 0)  # prevent negatives
+            #comp.number_of_medicines -= 1
+            comp.number_of_medicines = max(comp.number_of_medicines-1, 0)  # prevent negatives
+            taken_time = parser.isoparse(entry.created_at)
             comp.taken = True
-            comp.taken_at = parser.isoparse(entry.created_at)
+            comp.taken_at = taken_time
             comp.low_stock = comp.number_of_medicines < 4
             
+            #determinare expected schedule time
+            now = taken_time.time()
+            scheduled_times = [comp.morning_time, comp.afternoon_time, comp.evening_time]
+            scheduled = next((t for t in scheduled_times if t and abs(datetime.combine(datetime.today(), t) - taken_time).seconds < 3600), None)
+            is_late = scheduled is not None and now > scheduled
+
+
             log = MedicineLog(
                 compartment_number=comp.compartment_number,
                 medicine_name=comp.medicine_name,
                 taken_at=comp.taken_at,
-                action="taken"
+                action="taken",
+                remaining_pills=comp.number_of_medicines,
+                low_stock=comp.low_stock,
+                scheduled_time=scheduled,
+                is_late = is_late
+
             )
 
             session.add(log)
@@ -429,8 +444,11 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
             return {
                 "message": f"Compartment {comp_num} updated",
                 "new_count": comp.number_of_medicines,
-                "low_stock": comp.low_stock
+                "low_stock": comp.low_stock,
+                "scheduled_time": str(scheduled) if scheduled else None,
+                "is_late": is_late
             }
+
 
     return {"message": "No valid update processed"}
 
