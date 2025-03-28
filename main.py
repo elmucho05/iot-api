@@ -388,6 +388,7 @@ def get_pending_medicines(compartment_number: int, session: Session = Depends(ge
 #################################################################
 ###################### Adafruit stuff ###########################
 #################################################################
+# 🔁 Update webhook to store all log info
 @app.post("/adafruit-taken-webhook/")
 def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_session)):
     for entry in data:
@@ -414,21 +415,13 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
             comp.taken_at = taken_time
             comp.low_stock = comp.number_of_medicines < 4
 
-            # ⏰ Determine expected scheduled time (very simple for now)
-            now = taken_time.time()
-            scheduled_times = [comp.morning_time, comp.afternoon_time, comp.evening_time]
-            scheduled = next((t for t in scheduled_times if t and abs(datetime.combine(datetime.today(), t) - taken_time).seconds < 3600), None)
-            is_late = scheduled is not None and now > scheduled
-
             log = MedicineLog(
                 compartment_number=comp.compartment_number,
                 medicine_name=comp.medicine_name,
                 taken_at=taken_time,
                 action="taken",
                 remaining_pills=comp.number_of_medicines,
-                low_stock=comp.low_stock,
-                scheduled_time=scheduled,
-                is_late=is_late
+                low_stock=comp.low_stock
             )
 
             session.add(log)
@@ -439,9 +432,7 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
             return {
                 "message": f"Compartment {comp_num} updated",
                 "new_count": comp.number_of_medicines,
-                "low_stock": comp.low_stock,
-                "scheduled_time": str(scheduled) if scheduled else None,
-                "is_late": is_late
+                "low_stock": comp.low_stock
             }
 
     return {"message": "No valid update processed"}
@@ -471,28 +462,38 @@ def get_logs_by_day(date: str, session: Session = Depends(get_session)):
     return logs
 
 @app.post("/compartments/{compartment_number}/refill")
-def refill_medicine(compartment_number : int, refill: RefillRequest, session : Session = Depends(get_session)):
-    compartment = session.exec(select(Compartment).where(Compartment.compartment_number==compartment_number)).first()
+def refill_medicine(compartment_number: int, refill: RefillRequest, session: Session = Depends(get_session)):
+    comp = session.exec(
+        select(Compartment).where(Compartment.compartment_number == compartment_number)
+    ).first()
 
     if compartment_number not in [1, 2, 3]:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid compartment number. Only 1, 2, or 3 are allowed."
-        )
-    
-    if not compartment:
+        raise HTTPException(status_code=400, detail="Invalid compartment number. Only 1, 2, or 3 are allowed.")
+
+    if not comp:
         raise HTTPException(status_code=404, detail="Compartment not found")
-    
-    compartment.number_of_medicines += refill.amount  #if i want just the value, can simply remove the +
-    compartment.taken = False
-    compartment.low_stock = compartment.number_of_medicines < 4
-    session.add(compartment)
+
+    comp.number_of_medicines += refill.amount
+    comp.taken = False
+    comp.low_stock = comp.number_of_medicines < 4
+
+    log = MedicineLog(
+        compartment_number=compartment_number,
+        medicine_name=comp.medicine_name,
+        taken_at=datetime.utcnow(),
+        action="refill",
+        remaining_pills=comp.number_of_medicines,
+        low_stock=comp.low_stock
+    )
+
+    session.add(log)
+    session.add(comp)
     session.commit()
-    session.refresh(compartment)
+    session.refresh(comp)
 
     return {
         "message": f"Refilled compartment {compartment_number} with {refill.amount} units.",
-        "current_total": compartment.number_of_medicines
+        "current_total": comp.number_of_medicines
     }
 
 
@@ -558,70 +559,137 @@ def refill_medicine(compartment_number : int, refill: RefillRequest, session : S
 #     return {"message": "No valid compartment found in the received data."}
 
 
-# @app.post("/populate-test-data/")
-# def populate_test_data(session: Session = Depends(get_session)):
-#     """
-#     Populates the database with:
-#     - Compartment 1: A repeated medicine with normal stock
-#     - Compartment 2: A repeated medicine with low stock, already taken
-#     - Compartment 3: A one-time medicine, not taken yet
-#     """
+@app.post("/populate-test-data/")
+def populate_test_data(session: Session = Depends(get_session)):
+    """
+    Populates the database with:
+    - Compartment 1: A repeated medicine with normal stock
+    - Compartment 2: A repeated medicine with low stock, already taken
+    - Compartment 3: A one-time medicine, not taken yet
+    """
 
-#     # Clear any existing data
-#     session.exec(delete(Compartment))
-#     session.commit()
+    # Clear any existing data
+    session.exec(delete(Compartment))
+    session.commit()
 
-#     def str_to_time(t: str) -> Optional[time]:
-#         return datetime.strptime(t, "%H:%M:%S").time() if t else None
+    def str_to_time(t: str) -> Optional[time]:
+        return datetime.strptime(t, "%H:%M:%S").time() if t else None
 
-#     now = datetime.utcnow()
+    now = datetime.utcnow()
 
-#     test_data = [
-#         Compartment(
-#             compartment_number=1,
-#             medicine_name="Paracetamol",
-#             number_of_medicines=10,
-#             to_be_repeated=True,
-#             taken=False,
-#             taken_at=None,
-#             low_stock=False,
-#             morning_time=str_to_time("08:00:00"),
-#             afternoon_time=str_to_time("14:00:00"),
-#             evening_time=str_to_time("20:00:00"),
-#             time_if_not_repeated=None
-#         ),
-#         Compartment(
-#             compartment_number=2,
-#             medicine_name="Ibuprofen",
-#             number_of_medicines=2,  # Low stock
-#             to_be_repeated=True,
-#             taken=True,
-#             taken_at=now,
-#             low_stock=True,
-#             morning_time=str_to_time("09:00:00"),
-#             afternoon_time=str_to_time("15:00:00"),
-#             evening_time=str_to_time("21:00:00"),
-#             time_if_not_repeated=None
-#         ),
-#         Compartment(
-#             compartment_number=3,
-#             medicine_name="Antibiotic",
-#             number_of_medicines=5,
-#             to_be_repeated=False,
-#             taken=False,
-#             taken_at=None,
-#             low_stock=False,
-#             morning_time=None,
-#             afternoon_time=None,
-#             evening_time=None,
-#             time_if_not_repeated=str_to_time("12:00:00")
-#         )
-#     ]
+    test_data = [
+        Compartment(
+            compartment_number=1,
+            medicine_name="Paracetamol",
+            number_of_medicines=10,
+            to_be_repeated=True,
+            taken=False,
+            taken_at=None,
+            low_stock=False,
+            morning_time=str_to_time("08:00:00"),
+            afternoon_time=str_to_time("14:00:00"),
+            evening_time=str_to_time("20:00:00"),
+            time_if_not_repeated=None
+        ),
+        Compartment(
+            compartment_number=2,
+            medicine_name="Ibuprofen",
+            number_of_medicines=2,  # Low stock
+            to_be_repeated=True,
+            taken=True,
+            taken_at=now,
+            low_stock=True,
+            morning_time=str_to_time("09:00:00"),
+            afternoon_time=str_to_time("15:00:00"),
+            evening_time=str_to_time("21:00:00"),
+            time_if_not_repeated=None
+        ),
+        Compartment(
+            compartment_number=3,
+            medicine_name="Antibiotic",
+            number_of_medicines=5,
+            to_be_repeated=False,
+            taken=False,
+            taken_at=None,
+            low_stock=False,
+            morning_time=None,
+            afternoon_time=None,
+            evening_time=None,
+            time_if_not_repeated=str_to_time("12:00:00")
+        )
+    ]
 
-#     session.add_all(test_data)
-#     session.commit()
+    session.add_all(test_data)
+    session.commit()
 
-#     return {"message": "Test data added successfully!"}
+    return {"message": "Test data added successfully!"}
+
+@app.get("/logs/summary/by-compartment")
+def get_log_summary(session: Session = Depends(get_session)):
+    summary = []
+
+    for comp_num in [1, 2, 3]:
+        logs = session.exec(
+            select(MedicineLog).where(MedicineLog.compartment_number == comp_num)
+        ).all()
+
+        taken_logs = [log for log in logs if log.action == "taken"]
+        refill_logs = [log for log in logs if log.action == "refill"]
+
+        last_taken = max([log.taken_at for log in taken_logs], default=None)
+        last_refill = max([log.taken_at for log in refill_logs], default=None)
+        total_taken = len(taken_logs)
+        total_refill = sum([log.remaining_pills or 0 for log in refill_logs])
+
+        current_stock = session.exec(
+            select(Compartment.number_of_medicines).where(Compartment.compartment_number == comp_num)
+        ).first()
+
+        summary.append({
+            "compartment": comp_num,
+            "total_taken": total_taken,
+            "total_refilled": total_refill,
+            "last_taken": last_taken,
+            "last_refill": last_refill,
+            "current_stock": current_stock
+        })
+
+    return summary
+
+@app.get("/logs/last-actions")
+def get_last_actions(session: Session = Depends(get_session)):
+    result = []
+    for comp_num in [1, 2, 3]:
+        last_log = session.exec(
+            select(MedicineLog)
+            .where(MedicineLog.compartment_number == comp_num)
+            .order_by(MedicineLog.taken_at.desc())
+        ).first()
+
+        if last_log:
+            result.append({
+                "compartment": comp_num,
+                "last_action": last_log.action,
+                "medicine": last_log.medicine_name,
+                "timestamp": last_log.taken_at,
+                "remaining_pills": last_log.remaining_pills,
+                "low_stock": last_log.low_stock
+            })
+    return result
+
+@app.get("/logs/stats")
+def get_log_stats(session: Session = Depends(get_session)):
+    logs = session.exec(select(MedicineLog)).all()
+
+    total_taken = sum(1 for log in logs if log.action == "taken")
+    total_refills = sum(1 for log in logs if log.action == "refill")
+    low_stock_events = sum(1 for log in logs if log.low_stock)
+
+    return {
+        "total_taken": total_taken,
+        "total_refills": total_refills,
+        "low_stock_events": low_stock_events
+    }
 
 
 # @app.post("/adafruit-taken-webhook/")
