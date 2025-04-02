@@ -283,7 +283,7 @@ def delete_all_compartments(session: Session = Depends(get_session)):
     """
     Deletes all compartments from the database.
     """
-    session.exec(select(Compartment).delete())
+    session.exec(delete(Compartment))
     session.commit()
     return {"message": "All compartments have been deleted"}
 
