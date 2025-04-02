@@ -242,40 +242,43 @@ def update_compartment(compartment_id: int, compartment_update: CompartmentUpdat
 
 
 
-@app.delete("/compartments/{compartment_number}/{medicine_name}")
-def delete_medicine_from_compartment(compartment_number: int, medicine_name: str, session: Session = Depends(get_session)):
+
+@app.delete("/compartments/{compartment_number}")
+def delete_medicine_from_compartment(
+    compartment_number: int,
+    session: Session = Depends(get_session)
+):
     """
     Deletes all entries of a specific medicine from a given compartment.
     """
-    # Validate compartment_number
     if compartment_number not in [1, 2, 3]:
         raise HTTPException(
             status_code=400,
             detail="compartment_number must be 1, 2, or 3."
         )
 
-    # Find the medicine in the specified compartment
-    compartments = session.exec(
+    # Check existence first
+    exists = session.exec(
         select(Compartment).where(
-            (Compartment.compartment_number == compartment_number) &
-            (Compartment.medicine_name == medicine_name)
-        )
-    ).all()
+            (Compartment.compartment_number == compartment_number))
+    ).first()
 
-    if not compartments:
+    if not exists:
         raise HTTPException(
             status_code=404,
-            detail=f"No medicine named '{medicine_name}' found in compartment {compartment_number}."
+            detail=f"No medicine found in compartment {compartment_number}."
         )
 
-    # Delete all matching records
-    for compartment in compartments:
-        session.delete(compartment)
-    
+    # Efficient bulk delete
+    session.exec(
+        delete(Compartment).where(
+            (Compartment.compartment_number == compartment_number)
+        )
+    )
     session.commit()
-    
+
     return {
-        "message": f"All entries of '{medicine_name}' have been removed from compartment {compartment_number}."
+        "message": f"All entries of '{compartment_number}' have been removed."
     }
 
 @app.delete("/compartments/")
