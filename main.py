@@ -4,12 +4,20 @@ from datetime import datetime, time, timedelta, date, timezone
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from contextlib import asynccontextmanager
+from datetime import datetime, time, timedelta, date, timezone
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from contextlib import asynccontextmanager
 
 from fastapi.middleware.cors import CORSMiddleware
 from collections import defaultdict
 from random import choice, randint
 from fastapi.responses import JSONResponse
+from collections import defaultdict
+from random import choice, randint
+from fastapi.responses import JSONResponse
 
+import requests
 import requests
 
 from datetime import time
@@ -98,10 +106,13 @@ class MedicineLog(SQLModel, table=True):
     medicine_name: str
     taken_at: Optional[datetime] = None  # This can be time of action (taken/refill/manual)
     action: str = Field(default="taken")  # "taken", "refill", "manual" "scheduled"
+    taken_at: Optional[datetime] = None  # This can be time of action (taken/refill/manual)
+    action: str = Field(default="taken")  # "taken", "refill", "manual" "scheduled"
     remaining_pills: Optional[int] = None
     low_stock: Optional[bool] = None
     scheduled_time: Optional[time] = None  # when it was supposed to be taken
     is_late: Optional[bool] = None
+    scheduled_date: Optional[date] = None
     scheduled_date: Optional[date] = None
 
 def create_db_and_tables():
@@ -290,6 +301,8 @@ def create_compartment(compartment: CompartmentCreate, session: Session = Depend
     """
     Creates a new medicine in a compartment and automatically adds 'scheduled' logs for today.
     """
+    Creates a new medicine in a compartment and automatically adds 'scheduled' logs for today.
+    """
     if compartment.compartment_number not in [1, 2, 3]:
         raise HTTPException(
             status_code=400,
@@ -316,6 +329,7 @@ def create_compartment(compartment: CompartmentCreate, session: Session = Depend
         )
 
     db_compartment = Compartment.model_validate(compartment)
+    db_compartment.low_stock = db_compartment.number_of_medicines < 4  # auto-calculate stock status
     db_compartment.low_stock = db_compartment.number_of_medicines < 4  # auto-calculate stock status
     session.add(db_compartment)
     session.commit()
@@ -347,6 +361,7 @@ def create_compartment(compartment: CompartmentCreate, session: Session = Depend
 
     session.commit()
     return db_compartment
+
 
 
 
@@ -456,6 +471,7 @@ def update_compartment(compartment_id: int, compartment_update: CompartmentUpdat
     if not compartment:
         raise HTTPException(status_code=404, detail="Compartment not found")
 
+    original_name = compartment.medicine_name
     original_name = compartment.medicine_name
     update_data = compartment_update.model_dump(exclude_unset=True)
 
@@ -654,12 +670,21 @@ def get_pending_medicines(
     compartment_number: int,
     session: Session = Depends(get_session)
 ):
+def get_pending_medicines(
+    compartment_number: int,
+    session: Session = Depends(get_session)
+):
     """
+    Ritorna le medicine nel compartimento specificato che non sono ancora state prese (taken=False).
     Ritorna le medicine nel compartimento specificato che non sono ancora state prese (taken=False).
     """
     if compartment_number not in [1, 2, 3]:
         raise HTTPException(status_code=400, detail="compartment_number must be 1, 2, or 3.")
+        raise HTTPException(status_code=400, detail="compartment_number must be 1, 2, or 3.")
 
+    pending = session.exec(
+        select(Compartment)
+        .where(
     pending = session.exec(
         select(Compartment)
         .where(
@@ -667,6 +692,10 @@ def get_pending_medicines(
             (Compartment.taken == False)
         )
     ).all()
+
+    return pending
+
+
 
     return pending
 
@@ -705,6 +734,7 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
             # ✅ Aggiorna compartimento
             comp.taken = True
             comp.taken_at = taken_time
+            comp.number_of_medicines = max(comp.number_of_medicines - 1, 0)
             comp.number_of_medicines = max(comp.number_of_medicines - 1, 0)
             comp.low_stock = comp.number_of_medicines < 4
 
@@ -785,6 +815,7 @@ def refill_medicine(compartment_number: int, refill: RefillRequest, session: Ses
     log = MedicineLog(
         compartment_number=compartment_number,
         medicine_name=comp.medicine_name,
+        ##taken_at=datetime.utcnow(),
         ##taken_at=datetime.utcnow(),
         action="refill",
         remaining_pills=comp.number_of_medicines,
@@ -952,6 +983,29 @@ def get_logs_by_day(date: str, session: Session = Depends(get_session)):
 
 
 @app.get("/logs/by-compartment")
+
+###################### LOGS ####################
+@app.get("/logs/", response_model=List[MedicineLog])
+def get_all_logs(session: Session = Depends(get_session)):
+    return session.exec(
+        select(MedicineLog).order_by(MedicineLog.scheduled_date.desc(), MedicineLog.taken_at.desc())
+    ).all()
+
+@app.get("/logs/by-day/{date}", response_model=List[MedicineLog])
+def get_logs_by_day(date: str, session: Session = Depends(get_session)):
+    try:
+        day_start = datetime.fromisoformat(date).date()
+    except:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    logs = session.exec(
+        select(MedicineLog).where(MedicineLog.scheduled_date == day_start).order_by(MedicineLog.scheduled_time)
+    ).all()
+
+    return logs
+
+
+@app.get("/logs/by-compartment")
 def get_log_summary(session: Session = Depends(get_session)):
     summary = []
 
@@ -1025,7 +1079,16 @@ def get_log_stats(session: Session = Depends(get_session)):
 
 #     now = datetime.utcnow()
 #     today = now.date()
+# @app.get("/logs/missed")
+# def get_missed_doses(session: Session = Depends(get_session)):
+#     compartments = session.exec(select(Compartment)).all()
+#     missed = []
 
+#     now = datetime.utcnow()
+#     today = now.date()
+
+#     for comp in compartments:
+#         if not comp.to_be_repeated:
 #     for comp in compartments:
 #         if not comp.to_be_repeated:
 #             continue
