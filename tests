@@ -36,3 +36,47 @@
   "time_if_not_repeated": null
 }
 
+
+
+
+
+
+######## createcompartment
+{
+  "compartment_number": 1,
+  "medicine_name": "Paracetamol",
+  "number_of_medicines": 15,
+  "to_be_repeated": true,
+  "morning_time": "08:00:00",
+  "afternoon_time": "14:00:00",
+  "evening_time": "20:00:00",
+  "time_if_not_repeated": null
+}
+
+{
+  "compartment_number": 2,
+  "medicine_name": "Antibiotic",
+  "number_of_medicines": 5,
+  "to_be_repeated": false,
+  "morning_time": null,
+  "afternoon_time": null,
+  "evening_time": null,
+  "time_if_not_repeated": "12:00:00"
+}
+[
+  {
+    "value": "1",
+    "feed_name": "comp1-taken",
+    "feed_key": "comp1-taken",
+    "created_at": "2025-04-06T08:05:00Z",
+    "updated_at": "2025-04-06T08:05:00Z",
+    "expiration": 1746554036,
+    "id": "test123",
+    "feed_id": 9999,
+    "location": {
+      "lat": null,
+      "lon": null,
+      "ele": null
+    }
+  }
+]

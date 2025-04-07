@@ -1,9 +1,16 @@
 from typing import Optional, List
 from typing import Annotated
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, date, timezone
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from contextlib import asynccontextmanager
 
 from fastapi.middleware.cors import CORSMiddleware
+from collections import defaultdict
+from random import choice, randint
+from fastapi.responses import JSONResponse
 
+import requests
 
 from datetime import time
 from fastapi import FastAPI, HTTPException, Depends, Query, Body
@@ -13,11 +20,9 @@ from pydantic import BaseModel
 import json
 from dateutil import parser
 import httpx
-ADAFRUIT_FEED_URLS = {
-    1:  "https://io.adafruit.com/api/v2/webhooks/feed/hDxXDFEQ581nYMaygY2nHRMN9nXm",
-    2:  "https://io.adafruit.com/api/v2/webhooks/feed/CfAs3xJMCTNSgTENkrnZgQok8cg2",
-    3:  "https://io.adafruit.com/api/v2/webhooks/feed/8ethcgUgXJ6CxZh3Bx5SSYihoNnG" 
-}
+import configparser
+from zoneinfo import ZoneInfo
+
 
 # Database Configuration
 sqlite_file_name = "medicine_db.db"
@@ -86,12 +91,13 @@ class MedicineLog(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     compartment_number: int
     medicine_name: str
-    taken_at: datetime  # This can be time of action (taken/refill/manual)
-    action: str = Field(default="taken")  # "taken", "refill", "manual"
+    taken_at: Optional[datetime] = None  # This can be time of action (taken/refill/manual)
+    action: str = Field(default="taken")  # "taken", "refill", "manual" "scheduled"
     remaining_pills: Optional[int] = None
     low_stock: Optional[bool] = None
     scheduled_time: Optional[time] = None  # when it was supposed to be taken
     is_late: Optional[bool] = None
+    scheduled_date: Optional[date] = None
 
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
@@ -118,10 +124,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+config = configparser.ConfigParser()
+config.read('config.ini')
+if not config.has_section("HTTPAIO"):
+    raise RuntimeError("❌ config.ini missing [HTTPAIO] section")
+
+url = config.get("HTTPAIO", "Url")
+aio_key = config.get("HTTPAIO", "X-AIO-Key")
+
+def post_to_adafruit(compartment_index: int, value: int):
+    if compartment_index > 2:
+        return
+
+    print("Executing adafruit post ")
+
+    feed_key = f"Feed{compartment_index + 1}"  # Feed1, Feed2, Feed3
+    #url = config.get("HTTPAIO", "Url")
+    feed = config.get("HTTPAIO", feed_key)
+
+    full_url = f"{url}{feed}/data"
+    headers = {"X-AIO-Key": aio_key}
+    payload = {"value": value}
+
+    print(f"> 📤 POST to {full_url} (value={value})")
+
+    try:
+        res = requests.post(full_url, headers=headers, data=payload)
+        res.raise_for_status()
+        print(f"✅ POST success: {res.status_code}")
+    except Exception as e:
+        print(f"❌ POST error: {e}")
+
+
+def check_scheduled_logs():
+    with Session(engine) as session:
+        now = datetime.utcnow()
+        logs = session.exec(
+            select(MedicineLog).where(
+                MedicineLog.action == "scheduled",
+                MedicineLog.scheduled_time != None,
+                MedicineLog.scheduled_date == now.date()
+            )
+        ).all()
+        print("[⏱] Esecuzione cron avviata")
+        updated = 0
+
+        for log in logs:
+            sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time)
+            seconds_since_sched = (now - sched_dt).total_seconds()
+            seconds_to_sched = (sched_dt - now).total_seconds()
+
+            # ✅ Controlla se è da marcare come missed (ritardo > 90 minuti)
+            if seconds_since_sched > 5400 and not log.taken_at:
+                log.action = "missed"
+                log.is_late = True
+                session.add(log)
+                updated += 1
+                print(f"❌ Log {log.id} marcato come missed (ritardo > 90 min)")
+
+            # ✅ Trigger Adafruit se è previsto entro 10 minuti
+            if 0 <= seconds_to_sched <= 600:
+                print(f"🔔 Medicinale previsto entro 10 minuti (log {log.id})")
+
+                comp = session.exec(
+                    select(Compartment).where(Compartment.compartment_number == log.compartment_number)
+                ).first()
+
+                if comp:
+                    comp.taken = False
+                    session.add(comp)
+                    post_to_adafruit(comp.compartment_number - 1, 0)
+                    print(f"📤 Comando inviato ad Adafruit per compartimento {comp.compartment_number}")
+
+        session.commit()
+
+        if updated:
+            print(f"[✔] Logs aggiornati: {updated} medicine marcate come missed")
 
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(check_scheduled_logs, IntervalTrigger(minutes=1))
+    scheduler.start()
 
 
 # API Endpoints
@@ -129,8 +214,8 @@ def on_startup():
 @app.post("/compartments/createcompartment", response_model=CompartmentPublic)
 def create_compartment(compartment: CompartmentCreate, session: Session = Depends(get_session)):
     """
-    Ensure that if `to_be_repeated` is False, `time_if_not_repeated` is required.
-    Validate that `compartment_number` is 1, 2, or 3.    """
+    Creates a new medicine in a compartment and automatically adds 'scheduled' logs for today.
+    """
     if compartment.compartment_number not in [1, 2, 3]:
         raise HTTPException(
             status_code=400,
@@ -150,10 +235,38 @@ def create_compartment(compartment: CompartmentCreate, session: Session = Depend
         )
 
     db_compartment = Compartment.model_validate(compartment)
+    db_compartment.low_stock = db_compartment.number_of_medicines < 4  # auto-calculate stock status
     session.add(db_compartment)
     session.commit()
     session.refresh(db_compartment)
+
+    # 🔁 CREAZIONE AUTOMATICA LOG SCHEDULED
+    today = datetime.utcnow().date()
+
+    def create_log(sched_time: time):
+        return MedicineLog(
+            compartment_number=db_compartment.compartment_number,
+            medicine_name=db_compartment.medicine_name,
+            action="scheduled",
+            taken_at=None,
+            remaining_pills=db_compartment.number_of_medicines,
+            low_stock=db_compartment.low_stock,
+            scheduled_time=sched_time,
+            scheduled_date=today,
+            is_late=False
+        )
+
+    if db_compartment.to_be_repeated:
+        times = [db_compartment.morning_time, db_compartment.afternoon_time, db_compartment.evening_time]
+        for sched_time in times:
+            if sched_time:
+                session.add(create_log(sched_time))
+    else:
+        session.add(create_log(db_compartment.time_if_not_repeated))
+
+    session.commit()
     return db_compartment
+
 
 
 @app.get("/compartments/", response_model=List[CompartmentPublic])
@@ -216,13 +329,13 @@ def create_multiple_compartments(
         session.refresh(comp)
 
     return created_compartments
-
 @app.patch("/compartments/updatecompartment/{compartment_id}", response_model=CompartmentPublic)
 def update_compartment(compartment_id: int, compartment_update: CompartmentUpdate, session: Session = Depends(get_session)):
     compartment = session.get(Compartment, compartment_id)
     if not compartment:
         raise HTTPException(status_code=404, detail="Compartment not found")
 
+    original_name = compartment.medicine_name
     update_data = compartment_update.model_dump(exclude_unset=True)
 
     # Validate compartment_number if it's being updated
@@ -238,6 +351,61 @@ def update_compartment(compartment_id: int, compartment_update: CompartmentUpdat
     session.add(compartment)
     session.commit()
     session.refresh(compartment)
+
+    # ✅ Aggiorna i log associati
+    related_logs = session.exec(
+        select(MedicineLog).where(
+            MedicineLog.compartment_number == compartment.compartment_number,
+            MedicineLog.medicine_name == original_name,
+            MedicineLog.scheduled_date == datetime.utcnow().date()
+        )
+    ).all()
+
+    now = datetime.utcnow()
+
+    for log in related_logs:
+        log.medicine_name = update_data.get("medicine_name", log.medicine_name)
+
+        if log.action in ["scheduled", "missed", "taken"]:
+            if log.scheduled_time:
+                # Aggiorna l'orario del log se cambiano i time slot
+                if not compartment.to_be_repeated:
+                    new_time = update_data.get("time_if_not_repeated")
+                    if new_time:
+                        log.scheduled_time = new_time
+                else:
+                    hour = log.scheduled_time.hour
+                    if 5 <= hour < 12:
+                        new_time = update_data.get("morning_time")
+                    elif 12 <= hour < 17:
+                        new_time = update_data.get("afternoon_time")
+                    else:
+                        new_time = update_data.get("evening_time")
+                    if new_time:
+                        log.scheduled_time = new_time
+
+            # Ripristina il log "missed" a "scheduled" se il nuovo orario è ancora valido
+            if log.action == "missed" and log.scheduled_time:
+                sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time)
+                if (now - sched_dt).total_seconds() <= 5400:
+                    log.action = "scheduled"
+                    log.is_late = False
+                    print(f"✅ Log {log.id} ripristinato da 'missed' a 'scheduled'")
+
+            if log.action == "scheduled":
+                log.remaining_pills = update_data.get("number_of_medicines", log.remaining_pills)
+
+                # ✅ Invia comando Adafruit se entro 10 minuti dal nuovo orario
+                if log.scheduled_time:
+                    sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time)
+                    seconds_to_sched = (sched_dt - now).total_seconds()
+                    if 0 <= seconds_to_sched <= 600:
+                        post_to_adafruit(log.compartment_number, 0)
+                        print(f"📤 Inviato comando a Adafruit per compartimento {log.compartment_number}")
+
+        session.add(log)
+
+    session.commit()
     return compartment
 
 
@@ -369,29 +537,33 @@ def get_taken_medicines(compartment_number: int, session: Session = Depends(get_
 
 
 @app.get("/compartments/{compartment_number}/pending", response_model=List[CompartmentPublic])
-def get_pending_medicines(compartment_number: int, session: Session = Depends(get_session)):
+def get_pending_medicines(
+    compartment_number: int,
+    session: Session = Depends(get_session)
+):
     """
-    Retrieves all medicines in the given compartment that are still pending (taken=False).
+    Ritorna le medicine nel compartimento specificato che non sono ancora state prese (taken=False).
     """
     if compartment_number not in [1, 2, 3]:
-        raise HTTPException(
-            status_code=400,
-            detail="compartment_number must be 1, 2, or 3."
-        )
+        raise HTTPException(status_code=400, detail="compartment_number must be 1, 2, or 3.")
 
-    medicines = session.exec(
-        select(Compartment).where(
+    pending = session.exec(
+        select(Compartment)
+        .where(
             (Compartment.compartment_number == compartment_number) &
             (Compartment.taken == False)
         )
     ).all()
 
-    return medicines
+    return pending
+
+
+
 
 #################################################################
 ###################### Adafruit stuff ###########################
 #################################################################
-# 🔁 Update webhook to store all log info
+# ✅ Update webhook to UPDATE the existing scheduled log instead of creating new one
 @app.post("/adafruit-taken-webhook/")
 def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_session)):
     for entry in data:
@@ -399,7 +571,7 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
         feed_map = {
             "comp1-taken": 1,
             "comp2-taken": 2,
-            "comp3-taken": 3
+            "comp3-taken": 31
         }
         comp_num = feed_map.get(feed)
         if not comp_num:
@@ -412,22 +584,56 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
             continue
 
         if entry.value.strip() == "1":
-            comp.number_of_medicines = max(comp.number_of_medicines - 1, 0)
             taken_time = parser.isoparse(entry.created_at)
             comp.taken = True
             comp.taken_at = taken_time
+            comp.number_of_medicines = max(comp.number_of_medicines - 1, 0)
             comp.low_stock = comp.number_of_medicines < 4
 
-            log = MedicineLog(
-                compartment_number=comp.compartment_number,
-                medicine_name=comp.medicine_name,
-                taken_at=taken_time,
-                action="taken",
-                remaining_pills=comp.number_of_medicines,
-                low_stock=comp.low_stock
-            )
+            # ✅ Cerca il primo log programmato con scheduled_date corrispondente e time vicino
+            scheduled_logs = session.exec(
+                select(MedicineLog).where(
+                    MedicineLog.compartment_number == comp.compartment_number,
+                    MedicineLog.medicine_name == comp.medicine_name,
+                    MedicineLog.scheduled_date == taken_time.date(),
+                    MedicineLog.action == "scheduled"
+                )
+            ).all()
 
-            session.add(log)
+            matched_log = None
+            for log in scheduled_logs:
+                if log.scheduled_time:
+                    sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time, tzinfo=taken_time.tzinfo)
+                    diff = abs((taken_time - sched_dt).total_seconds())
+                    if diff <= 1200:  # entro 20 minuti → OK e non in ritardo
+                        matched_log = log
+                        matched_log.is_late = False
+                        break
+                    elif diff <= 3600:  # entro 1 ora → OK ma in ritardo
+                        matched_log = log
+                        matched_log.is_late = True
+                        break
+
+            if matched_log:
+                matched_log.action = "taken"
+                matched_log.taken_at = taken_time
+                matched_log.remaining_pills = comp.number_of_medicines
+                matched_log.low_stock = comp.low_stock
+                session.add(matched_log)
+            else:
+                # Se nessun log trovato nel range → fallback: il più vicino, segnato come missed
+                if scheduled_logs:
+                    fallback = min(
+                        scheduled_logs,
+                        key=lambda log: abs((taken_time - datetime.combine(log.scheduled_date, log.scheduled_time, tzinfo=taken_time.tzinfo)).total_seconds())
+                    )
+                    fallback.action = "missed"
+                    fallback.taken_at = None
+                    fallback.remaining_pills = comp.number_of_medicines
+                    fallback.low_stock = comp.low_stock
+                    fallback.is_late = True
+                    session.add(fallback)
+
             session.add(comp)
             session.commit()
             session.refresh(comp)
@@ -439,30 +645,6 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
             }
 
     return {"message": "No valid update processed"}
-
-
-
-@app.get("/logs/", response_model=List[MedicineLog])
-def get_all_logs(session: Session = Depends(get_session)):
-    return session.exec(select(MedicineLog).order_by(MedicineLog.taken_at.desc())).all()
-
-@app.get("/logs/by-day/{date}", response_model=List[MedicineLog])
-def get_logs_by_day(date: str, session: Session = Depends(get_session)):
-    try:
-        day_start = datetime.fromisoformat(date)
-    except:
-        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
-
-    day_end = day_start + timedelta(days=1)
-
-    logs = session.exec(
-        select(MedicineLog).where(
-            MedicineLog.taken_at >= day_start,
-            MedicineLog.taken_at < day_end
-        ).order_by(MedicineLog.taken_at)
-    ).all()
-
-    return logs
 
 @app.post("/compartments/{compartment_number}/refill")
 def refill_medicine(compartment_number: int, refill: RefillRequest, session: Session = Depends(get_session)):
@@ -483,7 +665,7 @@ def refill_medicine(compartment_number: int, refill: RefillRequest, session: Ses
     log = MedicineLog(
         compartment_number=compartment_number,
         medicine_name=comp.medicine_name,
-        taken_at=datetime.utcnow(),
+        ##taken_at=datetime.utcnow(),
         action="refill",
         remaining_pills=comp.number_of_medicines,
         low_stock=comp.low_stock
@@ -627,7 +809,29 @@ def populate_test_data(session: Session = Depends(get_session)):
 
     return {"message": "Test data added successfully!"}
 
-@app.get("/logs/summary/by-compartment")
+
+###################### LOGS ####################
+@app.get("/logs/", response_model=List[MedicineLog])
+def get_all_logs(session: Session = Depends(get_session)):
+    return session.exec(
+        select(MedicineLog).order_by(MedicineLog.scheduled_date.desc(), MedicineLog.taken_at.desc())
+    ).all()
+
+@app.get("/logs/by-day/{date}", response_model=List[MedicineLog])
+def get_logs_by_day(date: str, session: Session = Depends(get_session)):
+    try:
+        day_start = datetime.fromisoformat(date).date()
+    except:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    logs = session.exec(
+        select(MedicineLog).where(MedicineLog.scheduled_date == day_start).order_by(MedicineLog.scheduled_time)
+    ).all()
+
+    return logs
+
+
+@app.get("/logs/by-compartment")
 def get_log_summary(session: Session = Depends(get_session)):
     summary = []
 
@@ -694,54 +898,387 @@ def get_log_stats(session: Session = Depends(get_session)):
         "low_stock_events": low_stock_events
     }
 
+# @app.get("/logs/missed")
+# def get_missed_doses(session: Session = Depends(get_session)):
+#     compartments = session.exec(select(Compartment)).all()
+#     missed = []
 
-# @app.post("/adafruit-taken-webhook/")
-# def pill_taken_from_adafruit(data: List[AdafruitData], session: Session = Depends(get_session)):
-#     for entry in data:
-#         feed_name = entry.feed_name.lower()
+#     now = datetime.utcnow()
+#     today = now.date()
 
-#         # Map feed name to compartment number (taken feeds only)
-#         feed_to_compartment = {
-#             "comp1-taken": 1,
-#             "comp2-taken": 2,
-#             "comp3-taken": 3
-#         }
-
-#         compartment_number = feed_to_compartment.get(feed_name)
-#         if not compartment_number:
+#     for comp in compartments:
+#         if not comp.to_be_repeated:
 #             continue
 
-#         compartment = session.exec(
-#             select(Compartment).where(Compartment.compartment_number == compartment_number)
-#         ).first()
+#         scheduled_times = [
+#             ("morning", comp.morning_time),
+#             ("afternoon", comp.afternoon_time),
+#             ("evening", comp.evening_time)
+#         ]
 
-#         if not compartment:
-#             return {"message": f"No medicine found in compartment {compartment_number}."}
+#         for label, sched_time in scheduled_times:
+#             if not sched_time:
+#                 continue
 
-#         try:
-#             remaining = int(entry.value)
-#         except ValueError:
-#             return {"error": f"Invalid value: {entry.value}"}
+#             sched_datetime = datetime.combine(today, sched_time)
+#             logs = session.exec(
+#                 select(MedicineLog).where(
+#                     MedicineLog.compartment_number == comp.compartment_number,
+#                     MedicineLog.taken_at >= sched_datetime - timedelta(minutes=30),
+#                     MedicineLog.taken_at <= sched_datetime + timedelta(minutes=90),
+#                     MedicineLog.action == "taken"
+#                 )
+#             ).all()
 
-#         try:
-#             taken_time = parser.isoparse(entry.created_at)
-#         except Exception:
-#             taken_time = datetime.utcnow()
+#             if not logs and now > sched_datetime:
+#                 missed.append({
+#                     "compartment": comp.compartment_number,
+#                     "medicine": comp.medicine_name,
+#                     "missed_time": sched_time.strftime("%H:%M:%S"),
+#                     "period": label
+#                 })
 
-#         compartment.taken = True
-#         compartment.taken_at = taken_time
-#         compartment.number_of_medicines = remaining
-#         compartment.low_stock = remaining < 4
+#     return missed
 
-#         session.add(compartment)
-#         session.commit()
-#         session.refresh(compartment)
+@app.get("/logs/punteggio-percentuale")
+def punteggio_percentuale(session: Session = Depends(get_session)):
+    compartments = session.exec(select(Compartment)).all()
+    taken_logs = session.exec(
+        select(MedicineLog).where(MedicineLog.action == "taken")
+    ).all()
 
-#         return {
-#             "message": f"Marked compartment {compartment_number} as taken.",
-#             "new_value": remaining,
-#             "taken_at": taken_time.isoformat(),
-#             "low_stock": compartment.low_stock
-#         }
+    expected = 0
+    actual = 0
+    today = datetime.utcnow().date()
 
-#     return {"message": "No valid compartment feed found."}
+    for comp in compartments:
+        if not comp.to_be_repeated:
+            continue
+
+        for t in [comp.morning_time, comp.afternoon_time, comp.evening_time]:
+            if t:
+                expected += 1
+                expected_datetime = datetime.combine(today, t)
+                match = any(
+                    abs((log.taken_at - expected_datetime).total_seconds()) < 3600 and
+                    log.compartment_number == comp.compartment_number
+                    for log in taken_logs
+                )
+                if match:
+                    actual += 1
+
+    score = round((actual / expected) * 100, 2) if expected else None
+    return {
+        "expected_doses_today": expected,
+        "taken_doses_today": actual,
+        "adherence_score_percent": score
+    }
+
+@app.get("/logs/low-stock-history")
+def low_stock_history(session: Session = Depends(get_session)):
+    logs = session.exec(
+        select(MedicineLog).where(
+            MedicineLog.low_stock == True
+        ).order_by(MedicineLog.taken_at.desc())
+    ).all()
+
+    return [
+        {
+            "compartment": log.compartment_number,
+            "medicine": log.medicine_name,
+            "timestamp": log.taken_at,
+            "remaining": log.remaining_pills
+        }
+        for log in logs
+    ]
+
+
+@app.post("/populate-logs-test/")
+def populate_test_logs(session: Session = Depends(get_session)):
+    """
+    Crea log di 7 giorni per test:
+    - Comparti 1, 2, 3
+    - Medicine prese/non prese
+    - Orari schedulati (mattina, pomeriggio, sera)
+    - Ricariche ogni 3 giorni
+    """
+    medicine_names = ["Paracetamol", "Ibuprofen", "Antibiotic"]
+    scheduled_times = [time(8, 0), time(14, 0), time(20, 0)]
+    today = datetime.utcnow().date()
+
+    for days_ago in range(7):
+        date = today - timedelta(days=days_ago)
+        for comp_num in [1, 2, 3]:
+            medicine = medicine_names[comp_num - 1]
+
+            for sched_time in scheduled_times:
+                scheduled_dt = datetime.combine(date, sched_time)
+                taken = choice([True, False])
+                if taken:
+                    taken_time = scheduled_dt + timedelta(minutes=randint(-15, 90))
+                    log = MedicineLog(
+                        compartment_number=comp_num,
+                        medicine_name=medicine,
+                        taken_at=taken_time,
+                        action="taken",
+                        remaining_pills=randint(1, 8),
+                        low_stock=randint(0, 1) == 1,
+                        scheduled_time=sched_time,
+                        is_late=taken_time.time() > sched_time
+                    )
+                    session.add(log)
+
+            if days_ago % 3 == 0:  # refill ogni 3 giorni
+                refill_time = datetime.combine(date, time(10, 30))
+                log = MedicineLog(
+                    compartment_number=comp_num,
+                    medicine_name=medicine,
+                    taken_at=refill_time,
+                    action="refill",
+                    remaining_pills=randint(5, 10),
+                    low_stock=False
+                )
+                session.add(log)
+
+    session.commit()
+    return {"message": "Dati di test inseriti con successo ✅"}
+
+from random import random
+
+# @app.post("/populate-scheduled-vs-taken-logs")
+# def populate_scheduled_vs_taken_logs(session: Session = Depends(get_session)):
+#     compartments = session.exec(
+#         select(Compartment).where(Compartment.to_be_repeated == True)
+#     ).all()
+
+#     days_back = 7
+#     logs_created = 0
+#     taken_created = 0
+#     today = datetime.utcnow().date()
+
+#     for offset in range(days_back):
+#         scheduled_date = today - timedelta(days=offset)
+
+#         for comp in compartments:
+#             scheduled_times = [
+#                 ("morning", comp.morning_time),
+#                 ("afternoon", comp.afternoon_time),
+#                 ("evening", comp.evening_time)
+#             ]
+
+#             for label, sched_time in scheduled_times:
+#                 if not sched_time:
+#                     continue
+
+#                 # Log scheduled
+#                 sched_log = MedicineLog(
+#                     compartment_number=comp.compartment_number,
+#                     medicine_name=comp.medicine_name,
+#                     action="scheduled",
+#                     scheduled_time=sched_time,
+#                     scheduled_date=scheduled_date,
+#                     taken_at=datetime.combine(scheduled_date, sched_time)
+#                 )
+#                 session.add(sched_log)
+#                 logs_created += 1
+
+#                 # 70% chance of being taken
+#                 if random() < 0.7:
+#                     taken_time = datetime.combine(scheduled_date, sched_time) + timedelta(minutes=randint(-10, 60))
+#                     taken_log = MedicineLog(
+#                         compartment_number=comp.compartment_number,
+#                         medicine_name=comp.medicine_name,
+#                         action="taken",
+#                         taken_at=taken_time,
+#                         remaining_pills=randint(2, 9),
+#                         low_stock=randint(0, 1) == 1,
+#                         scheduled_time=sched_time,
+#                         scheduled_date=scheduled_date,
+#                         is_late=taken_time.time() > sched_time
+#                     )
+#                     session.add(taken_log)
+#                     taken_created += 1
+
+#     session.commit()
+#     return {
+#         "message": f"✅ Created {logs_created} scheduled logs and {taken_created} taken logs for past {days_back} days."
+#     }
+
+# @app.get("/logs/scheduled-vs-taken-summary")
+# def scheduled_vs_taken_summary(session: Session = Depends(get_session)):
+#     today = datetime.utcnow().date()
+#     summary = []
+
+#     for day_offset in range(7):
+#         day = today - timedelta(days=day_offset)
+
+#         scheduled_logs = session.exec(
+#             select(MedicineLog).where(
+#                 MedicineLog.action == "scheduled",
+#                 MedicineLog.scheduled_date == day
+#             )
+#         ).all()
+
+#         taken_logs = session.exec(
+#             select(MedicineLog).where(
+#                 MedicineLog.action == "taken",
+#                 MedicineLog.scheduled_date == day
+#             )
+#         ).all()
+
+#         scheduled_count = len(scheduled_logs)
+#         taken_count = len(taken_logs)
+#         missed_count = scheduled_count - taken_count
+#         adherence = round((taken_count / scheduled_count) * 100, 2) if scheduled_count else None
+
+#         summary.append({
+#             "date": day.isoformat(),
+#             "scheduled": scheduled_count,
+#             "taken": taken_count,
+#             "missed": missed_count,
+#             "adherence_percent": adherence
+#         })
+
+#     return summary
+
+
+@app.get("/logs/correct")
+def get_correctly_taken_logs(session: Session = Depends(get_session)):
+    logs = session.exec(
+        select(MedicineLog).where(
+            MedicineLog.action == "taken",
+            MedicineLog.is_late == False
+        )
+    ).all()
+    return logs
+@app.get("/logs/late")
+def get_late_logs(session: Session = Depends(get_session)):
+    logs = session.exec(
+        select(MedicineLog).where(
+            MedicineLog.action == "taken",
+            MedicineLog.is_late == True
+        )
+    ).all()
+    return logs
+
+
+@app.get("/logs/missed")
+def get_missed_logs(session: Session = Depends(get_session)):
+    logs = session.exec(
+        select(MedicineLog).where(
+            MedicineLog.action == "missed"
+        )
+    ).all()
+    return logs
+
+
+@app.post("/logs/update-missed")
+def update_missed_logs(session: Session = Depends(get_session)):
+    now = datetime.utcnow()
+
+    logs = session.exec(
+        select(MedicineLog).where(
+            MedicineLog.action == "scheduled",
+            MedicineLog.scheduled_time != None,
+            MedicineLog.scheduled_date == now.date()
+        )
+    ).all()
+
+    updated = 0
+    for log in logs:
+        sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time)
+        if (now - sched_dt).total_seconds() > 3600:
+            log.action = "missed"
+            log.is_late = True
+            session.add(log)
+            updated += 1
+
+    session.commit()
+    return {"updated_missed": updated}
+
+
+@app.post("/daily-reset")
+def reset_medicines_and_schedule(session: Session = Depends(get_session)):
+    today = datetime.utcnow().date()
+
+    compartments = session.exec(select(Compartment).where(Compartment.to_be_repeated == True)).all()
+    logs_created = 0
+    compartments_reset = 0
+
+    for comp in compartments:
+        # Reset dello stato "taken" per ogni medicine ripetibile
+        comp.taken = False
+        comp.taken_at = None
+        session.add(comp)
+        compartments_reset += 1
+
+        times = [comp.morning_time, comp.afternoon_time, comp.evening_time]
+        for sched_time in times:
+            if not sched_time:
+                continue
+
+            # Evita duplicati
+            exists = session.exec(select(MedicineLog).where(
+                MedicineLog.compartment_number == comp.compartment_number,
+                MedicineLog.scheduled_date == today,
+                MedicineLog.scheduled_time == sched_time,
+                MedicineLog.action == "scheduled"
+            )).first()
+
+            if not exists:
+                log = MedicineLog(
+                    compartment_number=comp.compartment_number,
+                    medicine_name=comp.medicine_name,
+                    action="scheduled",
+                    scheduled_time=sched_time,
+                    scheduled_date=today,
+                    remaining_pills=comp.number_of_medicines,
+                    low_stock=comp.number_of_medicines < 4
+                )
+                session.add(log)
+                logs_created += 1
+
+    session.commit()
+
+    return {
+        "message": "Reset giornaliero completato ✅",
+        "compartments_reset": compartments_reset,
+        "logs_created": logs_created
+    }
+
+
+@app.get("/logs/daily-status")
+def get_daily_status(session: Session = Depends(get_session)):
+    today = datetime.utcnow().date()
+    compartments = session.exec(select(Compartment)).all()
+    status = []
+
+    for comp in compartments:
+        logs = session.exec(
+            select(MedicineLog).where(
+                MedicineLog.compartment_number == comp.compartment_number,
+                MedicineLog.scheduled_date == today
+            )
+        ).all()
+
+        log_map = {log.scheduled_time: log.action + (" (late)" if log.is_late else "") for log in logs}
+
+        if comp.to_be_repeated:
+            status.append({
+                "compartment": comp.compartment_number,
+                "medicine": comp.medicine_name,
+                "total_to_take": len([t for t in [comp.morning_time, comp.afternoon_time, comp.evening_time] if t]),
+                "morning": log_map.get(comp.morning_time, "not scheduled"),
+                "afternoon": log_map.get(comp.afternoon_time, "not scheduled"),
+                "evening": log_map.get(comp.evening_time, "not scheduled")
+            })
+        else:
+            status.append({
+                "compartment": comp.compartment_number,
+                "medicine": comp.medicine_name,
+                "total_to_take": 1,
+                "scheduled_time": comp.time_if_not_repeated,
+                "status": log_map.get(comp.time_if_not_repeated, "not scheduled")
+            })
+
+    return status
