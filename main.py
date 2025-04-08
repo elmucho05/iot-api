@@ -1,16 +1,9 @@
 from typing import Optional, List
 from typing import Annotated
-from datetime import datetime, time, timedelta, date, timezone
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.interval import IntervalTrigger
-from contextlib import asynccontextmanager
+from datetime import datetime, time, timedelta
 
 from fastapi.middleware.cors import CORSMiddleware
-from collections import defaultdict
-from random import choice, randint
-from fastapi.responses import JSONResponse
 
-import requests
 
 from datetime import time
 from fastapi import FastAPI, HTTPException, Depends, Query, Body
@@ -96,13 +89,12 @@ class MedicineLog(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     compartment_number: int
     medicine_name: str
-    taken_at: Optional[datetime] = None  # This can be time of action (taken/refill/manual)
-    action: str = Field(default="taken")  # "taken", "refill", "manual" "scheduled"
+    taken_at: datetime  # This can be time of action (taken/refill/manual)
+    action: str = Field(default="taken")  # "taken", "refill", "manual"
     remaining_pills: Optional[int] = None
     low_stock: Optional[bool] = None
     scheduled_time: Optional[time] = None  # when it was supposed to be taken
     is_late: Optional[bool] = None
-    scheduled_date: Optional[date] = None
 
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
@@ -288,8 +280,8 @@ def on_startup():
 @app.post("/compartments/createcompartment", response_model=CompartmentPublic)
 def create_compartment(compartment: CompartmentCreate, session: Session = Depends(get_session)):
     """
-    Creates a new medicine in a compartment and automatically adds 'scheduled' logs for today.
-    """
+    Ensure that if `to_be_repeated` is False, `time_if_not_repeated` is required.
+    Validate that `compartment_number` is 1, 2, or 3.    """
     if compartment.compartment_number not in [1, 2, 3]:
         raise HTTPException(
             status_code=400,
@@ -316,7 +308,6 @@ def create_compartment(compartment: CompartmentCreate, session: Session = Depend
         )
 
     db_compartment = Compartment.model_validate(compartment)
-    db_compartment.low_stock = db_compartment.number_of_medicines < 4  # auto-calculate stock status
     session.add(db_compartment)
     session.commit()
     session.refresh(db_compartment)
@@ -347,7 +338,6 @@ def create_compartment(compartment: CompartmentCreate, session: Session = Depend
 
     session.commit()
     return db_compartment
-
 
 
 @app.get("/compartments/", response_model=List[CompartmentPublic])
@@ -456,7 +446,6 @@ def update_compartment(compartment_id: int, compartment_update: CompartmentUpdat
     if not compartment:
         raise HTTPException(status_code=404, detail="Compartment not found")
 
-    original_name = compartment.medicine_name
     update_data = compartment_update.model_dump(exclude_unset=True)
 
     # Validate compartment_number if it's being updated
@@ -650,28 +639,24 @@ def get_taken_medicines(compartment_number: int, session: Session = Depends(get_
 
 
 @app.get("/compartments/{compartment_number}/pending", response_model=List[CompartmentPublic])
-def get_pending_medicines(
-    compartment_number: int,
-    session: Session = Depends(get_session)
-):
+def get_pending_medicines(compartment_number: int, session: Session = Depends(get_session)):
     """
-    Ritorna le medicine nel compartimento specificato che non sono ancora state prese (taken=False).
+    Retrieves all medicines in the given compartment that are still pending (taken=False).
     """
     if compartment_number not in [1, 2, 3]:
-        raise HTTPException(status_code=400, detail="compartment_number must be 1, 2, or 3.")
+        raise HTTPException(
+            status_code=400,
+            detail="compartment_number must be 1, 2, or 3."
+        )
 
-    pending = session.exec(
-        select(Compartment)
-        .where(
+    medicines = session.exec(
+        select(Compartment).where(
             (Compartment.compartment_number == compartment_number) &
             (Compartment.taken == False)
         )
     ).all()
 
-    return pending
-
-
-
+    return medicines
 
 #################################################################
 ###################### Adafruit stuff ###########################
@@ -705,7 +690,6 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
             # ✅ Aggiorna compartimento
             comp.taken = True
             comp.taken_at = taken_time
-            comp.number_of_medicines = max(comp.number_of_medicines - 1, 0)
             comp.low_stock = comp.number_of_medicines < 4
 
             # ✅ Cerca log "scheduled" corrispondente per oggi
@@ -785,7 +769,7 @@ def refill_medicine(compartment_number: int, refill: RefillRequest, session: Ses
     log = MedicineLog(
         compartment_number=compartment_number,
         medicine_name=comp.medicine_name,
-        ##taken_at=datetime.utcnow(),
+        taken_at=datetime.utcnow(),
         action="refill",
         remaining_pills=comp.number_of_medicines,
         low_stock=comp.low_stock
@@ -929,29 +913,7 @@ def populate_test_data(session: Session = Depends(get_session)):
 
     return {"message": "Test data added successfully!"}
 
-
-###################### LOGS ####################
-@app.get("/logs/", response_model=List[MedicineLog])
-def get_all_logs(session: Session = Depends(get_session)):
-    return session.exec(
-        select(MedicineLog).order_by(MedicineLog.scheduled_date.desc(), MedicineLog.taken_at.desc())
-    ).all()
-
-@app.get("/logs/by-day/{date}", response_model=List[MedicineLog])
-def get_logs_by_day(date: str, session: Session = Depends(get_session)):
-    try:
-        day_start = datetime.fromisoformat(date).date()
-    except:
-        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
-
-    logs = session.exec(
-        select(MedicineLog).where(MedicineLog.scheduled_date == day_start).order_by(MedicineLog.scheduled_time)
-    ).all()
-
-    return logs
-
-
-@app.get("/logs/by-compartment")
+@app.get("/logs/summary/by-compartment")
 def get_log_summary(session: Session = Depends(get_session)):
     summary = []
 
@@ -1018,16 +980,21 @@ def get_log_stats(session: Session = Depends(get_session)):
         "low_stock_events": low_stock_events
     }
 
-# @app.get("/logs/missed")
-# def get_missed_doses(session: Session = Depends(get_session)):
-#     compartments = session.exec(select(Compartment)).all()
-#     missed = []
 
-#     now = datetime.utcnow()
-#     today = now.date()
+# @app.post("/adafruit-taken-webhook/")
+# def pill_taken_from_adafruit(data: List[AdafruitData], session: Session = Depends(get_session)):
+#     for entry in data:
+#         feed_name = entry.feed_name.lower()
 
-#     for comp in compartments:
-#         if not comp.to_be_repeated:
+#         # Map feed name to compartment number (taken feeds only)
+#         feed_to_compartment = {
+#             "comp1-taken": 1,
+#             "comp2-taken": 2,
+#             "comp3-taken": 3
+#         }
+
+#         compartment_number = feed_to_compartment.get(feed_name)
+#         if not compartment_number:
 #             continue
 
 #         scheduled_times = [

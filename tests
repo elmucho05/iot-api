@@ -1,0 +1,38 @@
+{
+  "compartment_number": 1,
+  "medicine_name": "Paracetamol",
+  "number_of_medicines": 10,
+  "to_be_repeated": true,
+  "taken": false,
+  "morning_time": "08:00:00",
+  "afternoon_time": "14:00:00",
+  "evening_time": "20:00:00",
+  "time_if_not_repeated": null
+}
+{
+  "id": 2,
+  "compartment_number": 2,
+  "medicine_name": "Antibiotic",
+  "number_of_medicines": 5,
+  "to_be_repeated": false,
+  "morning_time": null,
+  "afternoon_time": null,
+  "evening_time": null,
+  "time_if_not_repeated": "12:00:00"
+}
+
+
+#### mark as taken
+{
+  "id": 1,
+  "compartment_number": 1,
+  "medicine_name": "Paracetamol",
+  "number_of_medicines": 10,
+  "to_be_repeated": true,
+  "taken": true,
+  "morning_time": "08:00:00",
+  "afternoon_time": "14:00:00",
+  "evening_time": "20:00:00",
+  "time_if_not_repeated": null
+}
+
