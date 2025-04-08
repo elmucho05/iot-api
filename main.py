@@ -20,11 +20,14 @@ from pydantic import BaseModel
 import json
 from dateutil import parser
 import httpx
+import asyncio
+
+from httpx import AsyncClient
 import configparser
 from zoneinfo import ZoneInfo
 
 import threading
-
+from fastapi.testclient import TestClient
 
 # Database Configuration
 sqlite_file_name = "medicine_db.db"
@@ -113,6 +116,7 @@ def get_session():
 SessionDep = Annotated[Session, Depends(get_session)]
 
 app = FastAPI()
+client = TestClient(app)
 origins = [
     "http://localhost",           # per test locali
     "http://localhost:4200",      # se usi Angular local
@@ -136,36 +140,35 @@ aio_key = config.get("HTTPAIO", "X-AIO-Key")
 
 
 
-def post_to_adafruit(compartment_index: int, value: int):
+async def post_to_adafruit_async(compartment_index: int, value: int):
     if compartment_index > 2:
         return
 
-    print("Executing adafruit post ")
-
-    feed_key = f"Feed{compartment_index + 1}"  # Feed1, Feed2, Feed3
-    #url = config.get("HTTPAIO", "Url")
+    config = configparser.ConfigParser()
+    config.read('config.ini')
+    url = config.get("HTTPAIO", "Url")
+    aio_key = config.get("HTTPAIO", "X-AIO-Key")
+    feed_key = f"Feed{compartment_index + 1}"
     feed = config.get("HTTPAIO", feed_key)
 
     full_url = f"{url}{feed}/data"
     headers = {"X-AIO-Key": aio_key}
     payload = {"value": value}
 
-    print(f"> 📤 POST to {full_url} (value={value})")
+    print(f"> 📤 [ASYNC] POST to {full_url} (value={value})")
 
     try:
-        res = requests.post(full_url, headers=headers, data=payload)
-        res.raise_for_status()
-        print(f"✅ POST success: {res.status_code}")
+        async with httpx.AsyncClient() as client:
+            res = await client.post(full_url, headers=headers, data=payload)
+            res.raise_for_status()
+            print(f"✅ POST success: {res.status_code}")
     except Exception as e:
         print(f"❌ POST error: {e}")
 
-def async_post_to_adafruit(compartment_index: int, value: int):
-    thread = threading.Thread(target=post_to_adafruit, args=(compartment_index, value))
-    thread.start()
 
-def check_scheduled_logs():
+async def check_scheduled_logs_async():
     with Session(engine) as session:
-        now = datetime.now(ZoneInfo("Europe/Rome"))  # 🇮🇹 orario italiano corretto
+        now = datetime.now(ZoneInfo("Europe/Rome"))
         logs = session.exec(
             select(MedicineLog).where(
                 MedicineLog.action == "scheduled",
@@ -173,26 +176,21 @@ def check_scheduled_logs():
                 MedicineLog.scheduled_date == now.date()
             )
         ).all()
-        print("[⏱] Esecuzione cron avviata")
+        print("[⏱] Async cron avviato")
         updated = 0
 
         for log in logs:
             sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time).replace(tzinfo=ZoneInfo("Europe/Rome"))
-            print("tempo estratto dai logs", sched_dt)
-            print("tempo ora", now)
-            seconds_since_sched = (now - sched_dt).total_seconds()
-            print("tempo passato da quando è stato schedulato : ", seconds_since_sched)
             seconds_to_sched = (sched_dt - now).total_seconds()
+            seconds_since_sched = (now - sched_dt).total_seconds()
 
-            # ✅ Controlla se è da marcare come missed (ritardo > 90 minuti)
             if seconds_since_sched > 5400 and not log.taken_at:
                 log.action = "missed"
                 log.is_late = True
                 session.add(log)
                 updated += 1
                 print(f"❌ Log {log.id} marcato come missed (ritardo > 90 min)")
-            print("printing the seconds up to a medicine", seconds_to_sched)
-            # ✅ Trigger Adafruit se è previsto entro 10 minuti
+
             if 0 <= seconds_to_sched <= 650:
                 print(f"🔔 Medicinale previsto entro 10 minuti (log {log.id})")
 
@@ -203,23 +201,85 @@ def check_scheduled_logs():
                 if comp:
                     comp.taken = False
                     session.add(comp)
-
-                    # 🔁 Chiamata in thread separato
-                    async_post_to_adafruit(comp.compartment_number - 1, 0)
-                    print(f"📤 Comando (threaded) inviato ad Adafruit per compartimento {comp.compartment_number}")
+                    await post_to_adafruit_async(comp.compartment_number - 1, 0)
+                    print(f"📤 Comando async inviato ad Adafruit per compartimento {comp.compartment_number}")
 
         session.commit()
-
         if updated:
             print(f"[✔] Logs aggiornati: {updated} medicine marcate come missed")
+
+async def periodic_check_loop():
+    await asyncio.sleep(3)
+    while True:
+        try:
+            await check_scheduled_logs_async()
+        except Exception as e:
+            print(f"❌ Errore nel cron async: {e}")
+        await asyncio.sleep(30)  # ogni 30 secondi
+
+
+async def reset_compartments_midnight_async():
+    print("[🌙] Inizio reset compartimenti (mezzanotte)")
+
+    # ✅ Prima estrai tutti i dati in formato "safe"
+    with Session(engine) as session:
+        compartments = session.exec(select(Compartment)).all()
+        compartments_data = [
+            {
+                "compartment_number": comp.compartment_number,
+                "medicine_name": comp.medicine_name,
+                "number_of_medicines": comp.number_of_medicines,
+                "to_be_repeated": comp.to_be_repeated,
+                "morning_time": comp.morning_time.isoformat() if comp.morning_time else None,
+                "afternoon_time": comp.afternoon_time.isoformat() if comp.afternoon_time else None,
+                "evening_time": comp.evening_time.isoformat() if comp.evening_time else None,
+                "time_if_not_repeated": comp.time_if_not_repeated.isoformat() if comp.time_if_not_repeated else None
+            }
+            for comp in compartments
+        ]
+
+    # ✅ Ora puoi lavorare con questi dati fuori dalla sessione
+    async with AsyncClient(base_url="http://localhost:8000") as async_client:
+        for payload in compartments_data:
+            comp_number = payload["compartment_number"]
+
+            # 🔥 Cancella il compartimento
+            with Session(engine) as delete_session:
+                delete_session.exec(
+                    delete(Compartment).where(Compartment.compartment_number == comp_number)
+                )
+                delete_session.commit()
+
+            # 🔁 Ricrea il compartimento tramite la route ufficiale
+            res = await async_client.post("/compartments/createcompartment", json=payload)
+            if res.status_code == 200:
+                print(f"✅ Compartimento {comp_number} ricreato con successo")
+            else:
+                print(f"❌ Errore nel ricreare compartimento {comp_number}: {res.status_code} - {res.text}")
+
+async def wait_until_midnight_loop():
+    await asyncio.sleep(5)
+    while True:
+        now = datetime.now(ZoneInfo("Europe/Rome"))
+        tomorrow = now.date() + timedelta(days=1)
+        midnight = datetime.combine(tomorrow, time(0, 0)).replace(tzinfo=ZoneInfo("Europe/Rome"))
+        seconds_to_midnight = (midnight - now).total_seconds()
+
+        print(f"[🕛] Prossimo reset a mezzanotte in {seconds_to_midnight:.0f} secondi")
+        await asyncio.sleep(seconds_to_midnight)
+
+        try:
+            await reset_compartments_midnight_async()
+        except Exception as e:
+            print(f"❌ Errore nel reset a mezzanotte: {e}")
 
 
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
-    # scheduler = BackgroundScheduler()
-    # scheduler.add_job(check_scheduled_logs, IntervalTrigger(minutes=1))
-    # scheduler.start()
+    asyncio.create_task(periodic_check_loop())
+    asyncio.create_task(wait_until_midnight_loop())
+
 
 
 # API Endpoints
@@ -234,7 +294,14 @@ def create_compartment(compartment: CompartmentCreate, session: Session = Depend
             status_code=400,
             detail="compartment_number must be 1, 2, or 3."
         )
-    
+    existing = session.exec(select(Compartment).where(Compartment.compartment_number == compartment.compartment_number)).first()
+
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Compartimento {compartment.compartment_number} è già occupato da '{existing.medicine_name}'. Puoi solo aggiornarlo o eliminarlo."
+        )
+
     if not compartment.to_be_repeated and not compartment.time_if_not_repeated:
         raise HTTPException(
             status_code=400,
@@ -255,7 +322,7 @@ def create_compartment(compartment: CompartmentCreate, session: Session = Depend
 
     # 🔁 CREAZIONE AUTOMATICA LOG SCHEDULED
     today = datetime.utcnow().date()
-
+    
     def create_log(sched_time: time):
         return MedicineLog(
             compartment_number=db_compartment.compartment_number,
@@ -307,41 +374,81 @@ def get_compartments_by_number(compartment_number: int, session: Session = Depen
     return compartments
 
 @app.post("/compartments/bulk-create", response_model=List[CompartmentPublic])
-def create_multiple_compartments(
-    compartments: List[CompartmentCreate] = Body(...),
+def bulk_create_compartments(
+    compartments: List[CompartmentCreate],
     session: Session = Depends(get_session)
 ):
-    created_compartments = []
+    """
+    🔄 Crea più compartimenti contemporaneamente (max uno per compartimento 1, 2, 3).
+    """
+    created = []
 
-    for compartment in compartments:
-        if compartment.compartment_number not in [1, 2, 3]:
+    for comp_data in compartments:
+        if comp_data.compartment_number not in [1, 2, 3]:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid compartment_number: {compartment.compartment_number}. Must be 1, 2, or 3."
+                detail=f"❌ Numero compartimento non valido: {comp_data.compartment_number}. Ammessi solo 1, 2, 3."
             )
-        
-        if not compartment.to_be_repeated and not compartment.time_if_not_repeated:
+
+        existing = session.exec(
+            select(Compartment).where(Compartment.compartment_number == comp_data.compartment_number)
+        ).first()
+
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"⚠️ Compartimento {comp_data.compartment_number} è già occupato da '{existing.medicine_name}'. Puoi solo aggiornarlo o eliminarlo."
+            )
+
+        # ✅ Validazioni orari
+        if not comp_data.to_be_repeated and not comp_data.time_if_not_repeated:
             raise HTTPException(
                 status_code=400,
-                detail=f"time_if_not_repeated is required for non-repeated medicine in compartment {compartment.compartment_number}."
+                detail=f"⏱ È richiesto 'time_if_not_repeated' per il compartimento {comp_data.compartment_number} se la medicina non è ripetuta."
             )
 
-        if compartment.to_be_repeated and compartment.time_if_not_repeated:
+        if comp_data.to_be_repeated and comp_data.time_if_not_repeated:
             raise HTTPException(
                 status_code=400,
-                detail=f"time_if_not_repeated must be None for repeated medicine in compartment {compartment.compartment_number}."
+                detail=f"⏱ Il campo 'time_if_not_repeated' deve essere vuoto se la medicina è ripetuta (compartimento {comp_data.compartment_number})."
             )
 
-        db_compartment = Compartment.model_validate(compartment)
-        session.add(db_compartment)
-        created_compartments.append(db_compartment)
+        db_comp = Compartment.model_validate(comp_data)
+        db_comp.low_stock = db_comp.number_of_medicines < 4
+        session.add(db_comp)
+        session.commit()
+        session.refresh(db_comp)
 
-    session.commit()
+        # 🔁 Log scheduled automatici
+        today = datetime.now(ZoneInfo("Europe/Rome")).date()
 
-    for comp in created_compartments:
-        session.refresh(comp)
+        def create_log(sched_time: time):
+            return MedicineLog(
+                compartment_number=db_comp.compartment_number,
+                medicine_name=db_comp.medicine_name,
+                action="scheduled",
+                taken_at=None,
+                remaining_pills=db_comp.number_of_medicines,
+                low_stock=db_comp.low_stock,
+                scheduled_time=sched_time,
+                scheduled_date=today,
+                is_late=False
+            )
 
-    return created_compartments
+        if db_comp.to_be_repeated:
+            times = [db_comp.morning_time, db_comp.afternoon_time, db_comp.evening_time]
+            for sched_time in times:
+                if sched_time:
+                    session.add(create_log(sched_time))
+        else:
+            session.add(create_log(db_comp.time_if_not_repeated))
+
+        session.commit()
+        created.append(db_comp)
+
+    return created
+
+
 @app.patch("/compartments/updatecompartment/{compartment_id}", response_model=CompartmentPublic)
 def update_compartment(compartment_id: int, compartment_update: CompartmentUpdate, session: Session = Depends(get_session)):
     compartment = session.get(Compartment, compartment_id)
@@ -374,8 +481,8 @@ def update_compartment(compartment_id: int, compartment_update: CompartmentUpdat
         )
     ).all()
 
-    now = datetime.utcnow()
-
+    now = datetime.now(ZoneInfo("Europe/Rome"))
+    
     for log in related_logs:
         log.medicine_name = update_data.get("medicine_name", log.medicine_name)
 
@@ -399,7 +506,7 @@ def update_compartment(compartment_id: int, compartment_update: CompartmentUpdat
 
             # Ripristina il log "missed" a "scheduled" se il nuovo orario è ancora valido
             if log.action == "missed" and log.scheduled_time:
-                sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time)
+                sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time).replace(tzinfo=ZoneInfo("Europe/Rome"))
                 if (now - sched_dt).total_seconds() <= 5400:
                     log.action = "scheduled"
                     log.is_late = False
@@ -407,14 +514,6 @@ def update_compartment(compartment_id: int, compartment_update: CompartmentUpdat
 
             if log.action == "scheduled":
                 log.remaining_pills = update_data.get("number_of_medicines", log.remaining_pills)
-
-                # ✅ Invia comando Adafruit se entro 10 minuti dal nuovo orario
-                if log.scheduled_time:
-                    sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time)
-                    seconds_to_sched = (sched_dt - now).total_seconds()
-                    if 0 <= seconds_to_sched <= 600:
-                        post_to_adafruit(log.compartment_number, 0)
-                        print(f"📤 Inviato comando a Adafruit per compartimento {log.compartment_number}")
 
         session.add(log)
 
@@ -577,6 +676,8 @@ def get_pending_medicines(
 ###################### Adafruit stuff ###########################
 #################################################################
 # ✅ Update webhook to UPDATE the existing scheduled log instead of creating new one
+from zoneinfo import ZoneInfo
+
 @app.post("/adafruit-taken-webhook/")
 def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_session)):
     for entry in data:
@@ -584,7 +685,7 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
         feed_map = {
             "comp1-taken": 1,
             "comp2-taken": 2,
-            "comp3-taken": 31
+            "comp3-taken": 3  # 🔧 sistemato: era 31 per errore
         }
         comp_num = feed_map.get(feed)
         if not comp_num:
@@ -597,13 +698,16 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
             continue
 
         if entry.value.strip() == "1":
-            taken_time = parser.isoparse(entry.created_at)
+            # 🇮🇹 Converte in orario italiano
+            taken_time = parser.isoparse(entry.created_at).astimezone(ZoneInfo("Europe/Rome"))
+
+            # ✅ Aggiorna compartimento
             comp.taken = True
             comp.taken_at = taken_time
             comp.number_of_medicines = max(comp.number_of_medicines - 1, 0)
             comp.low_stock = comp.number_of_medicines < 4
 
-            # ✅ Cerca il primo log programmato con scheduled_date corrispondente e time vicino
+            # ✅ Cerca log "scheduled" corrispondente per oggi
             scheduled_logs = session.exec(
                 select(MedicineLog).where(
                     MedicineLog.compartment_number == comp.compartment_number,
@@ -616,13 +720,14 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
             matched_log = None
             for log in scheduled_logs:
                 if log.scheduled_time:
-                    sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time, tzinfo=taken_time.tzinfo)
+                    sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time).replace(tzinfo=ZoneInfo("Europe/Rome"))
                     diff = abs((taken_time - sched_dt).total_seconds())
-                    if diff <= 1200:  # entro 20 minuti → OK e non in ritardo
+
+                    if diff <= 1200:  # entro 20 minuti
                         matched_log = log
                         matched_log.is_late = False
                         break
-                    elif diff <= 3600:  # entro 1 ora → OK ma in ritardo
+                    elif diff <= 3600:  # entro 1 ora (in ritardo)
                         matched_log = log
                         matched_log.is_late = True
                         break
@@ -634,11 +739,11 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
                 matched_log.low_stock = comp.low_stock
                 session.add(matched_log)
             else:
-                # Se nessun log trovato nel range → fallback: il più vicino, segnato come missed
+                # Nessun log entro i limiti → fallback: marca il più vicino come "missed"
                 if scheduled_logs:
                     fallback = min(
                         scheduled_logs,
-                        key=lambda log: abs((taken_time - datetime.combine(log.scheduled_date, log.scheduled_time, tzinfo=taken_time.tzinfo)).total_seconds())
+                        key=lambda log: abs((taken_time - datetime.combine(log.scheduled_date, log.scheduled_time).replace(tzinfo=ZoneInfo("Europe/Rome"))).total_seconds())
                     )
                     fallback.action = "missed"
                     fallback.taken_at = None
@@ -652,12 +757,13 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
             session.refresh(comp)
 
             return {
-                "message": f"Compartment {comp_num} updated",
-                "new_count": comp.number_of_medicines,
-                "low_stock": comp.low_stock
+                "message": f"✅ Compartimento {comp_num} aggiornato con successo.",
+                "nuove_pillole": comp.number_of_medicines,
+                "scorta_bassa": comp.low_stock
             }
 
-    return {"message": "No valid update processed"}
+    return {"message": "❌ Nessun aggiornamento valido ricevuto."}
+
 
 @app.post("/compartments/{compartment_number}/refill")
 def refill_medicine(compartment_number: int, refill: RefillRequest, session: Session = Depends(get_session)):
@@ -971,7 +1077,7 @@ def punteggio_percentuale(session: Session = Depends(get_session)):
         for t in [comp.morning_time, comp.afternoon_time, comp.evening_time]:
             if t:
                 expected += 1
-                expected_datetime = datetime.combine(today, t)
+                expected_datetime = datetime.combine(today, t).replace(tzinfo=ZoneInfo("Europe/Rome"))
                 match = any(
                     abs((log.taken_at - expected_datetime).total_seconds()) < 3600 and
                     log.compartment_number == comp.compartment_number
@@ -1025,7 +1131,7 @@ def populate_test_logs(session: Session = Depends(get_session)):
             medicine = medicine_names[comp_num - 1]
 
             for sched_time in scheduled_times:
-                scheduled_dt = datetime.combine(date, sched_time)
+                scheduled_dt = datetime.combine(date, sched_time).replace(tzinfo=ZoneInfo("Europe/Rome"))
                 taken = choice([True, False])
                 if taken:
                     taken_time = scheduled_dt + timedelta(minutes=randint(-15, 90))
@@ -1042,7 +1148,7 @@ def populate_test_logs(session: Session = Depends(get_session)):
                     session.add(log)
 
             if days_ago % 3 == 0:  # refill ogni 3 giorni
-                refill_time = datetime.combine(date, time(10, 30))
+                refill_time = datetime.combine(date, time(10, 30)).replace(tzinfo=ZoneInfo("Europe/Rome"))
                 log = MedicineLog(
                     compartment_number=comp_num,
                     medicine_name=medicine,
@@ -1199,7 +1305,7 @@ def update_missed_logs(session: Session = Depends(get_session)):
 
     updated = 0
     for log in logs:
-        sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time)
+        sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time).replace(tzinfo=ZoneInfo("Europe/Rome"))
         if (now - sched_dt).total_seconds() > 3600:
             log.action = "missed"
             log.is_late = True
@@ -1295,3 +1401,12 @@ def get_daily_status(session: Session = Depends(get_session)):
             })
 
     return status
+
+
+@app.post("/test/reset-compartments-midnight")
+async def test_reset_midnight():
+    """
+    🔁 Test manuale del reset di mezzanotte. Esegue subito la funzione di reset.
+    """
+    await reset_compartments_midnight_async()
+    return {"message": "✅ Reset simulato eseguito con successo."}
