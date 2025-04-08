@@ -116,7 +116,8 @@ def get_session():
 SessionDep = Annotated[Session, Depends(get_session)]
 
 app = FastAPI()
-client = TestClient(app)
+
+#client = TestClient(app)
 origins = [
     "http://localhost",           # per test locali
     "http://localhost:4200",      # se usi Angular local
@@ -1059,58 +1060,6 @@ def get_log_stats(session: Session = Depends(get_session)):
 
 #     return missed
 
-@app.get("/logs/punteggio-percentuale")
-def punteggio_percentuale(session: Session = Depends(get_session)):
-    compartments = session.exec(select(Compartment)).all()
-    taken_logs = session.exec(
-        select(MedicineLog).where(MedicineLog.action == "taken")
-    ).all()
-
-    expected = 0
-    actual = 0
-    today = datetime.utcnow().date()
-
-    for comp in compartments:
-        if not comp.to_be_repeated:
-            continue
-
-        for t in [comp.morning_time, comp.afternoon_time, comp.evening_time]:
-            if t:
-                expected += 1
-                expected_datetime = datetime.combine(today, t).replace(tzinfo=ZoneInfo("Europe/Rome"))
-                match = any(
-                    abs((log.taken_at - expected_datetime).total_seconds()) < 3600 and
-                    log.compartment_number == comp.compartment_number
-                    for log in taken_logs
-                )
-                if match:
-                    actual += 1
-
-    score = round((actual / expected) * 100, 2) if expected else None
-    return {
-        "expected_doses_today": expected,
-        "taken_doses_today": actual,
-        "adherence_score_percent": score
-    }
-
-@app.get("/logs/low-stock-history")
-def low_stock_history(session: Session = Depends(get_session)):
-    logs = session.exec(
-        select(MedicineLog).where(
-            MedicineLog.low_stock == True
-        ).order_by(MedicineLog.taken_at.desc())
-    ).all()
-
-    return [
-        {
-            "compartment": log.compartment_number,
-            "medicine": log.medicine_name,
-            "timestamp": log.taken_at,
-            "remaining": log.remaining_pills
-        }
-        for log in logs
-    ]
-
 
 @app.post("/populate-logs-test/")
 def populate_test_logs(session: Session = Depends(get_session)):
@@ -1291,80 +1240,6 @@ def get_missed_logs(session: Session = Depends(get_session)):
     return logs
 
 
-@app.post("/logs/update-missed")
-def update_missed_logs(session: Session = Depends(get_session)):
-    now = datetime.utcnow()
-
-    logs = session.exec(
-        select(MedicineLog).where(
-            MedicineLog.action == "scheduled",
-            MedicineLog.scheduled_time != None,
-            MedicineLog.scheduled_date == now.date()
-        )
-    ).all()
-
-    updated = 0
-    for log in logs:
-        sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time).replace(tzinfo=ZoneInfo("Europe/Rome"))
-        if (now - sched_dt).total_seconds() > 3600:
-            log.action = "missed"
-            log.is_late = True
-            session.add(log)
-            updated += 1
-
-    session.commit()
-    return {"updated_missed": updated}
-
-
-@app.post("/daily-reset")
-def reset_medicines_and_schedule(session: Session = Depends(get_session)):
-    today = datetime.utcnow().date()
-
-    compartments = session.exec(select(Compartment).where(Compartment.to_be_repeated == True)).all()
-    logs_created = 0
-    compartments_reset = 0
-
-    for comp in compartments:
-        # Reset dello stato "taken" per ogni medicine ripetibile
-        comp.taken = False
-        comp.taken_at = None
-        session.add(comp)
-        compartments_reset += 1
-
-        times = [comp.morning_time, comp.afternoon_time, comp.evening_time]
-        for sched_time in times:
-            if not sched_time:
-                continue
-
-            # Evita duplicati
-            exists = session.exec(select(MedicineLog).where(
-                MedicineLog.compartment_number == comp.compartment_number,
-                MedicineLog.scheduled_date == today,
-                MedicineLog.scheduled_time == sched_time,
-                MedicineLog.action == "scheduled"
-            )).first()
-
-            if not exists:
-                log = MedicineLog(
-                    compartment_number=comp.compartment_number,
-                    medicine_name=comp.medicine_name,
-                    action="scheduled",
-                    scheduled_time=sched_time,
-                    scheduled_date=today,
-                    remaining_pills=comp.number_of_medicines,
-                    low_stock=comp.number_of_medicines < 4
-                )
-                session.add(log)
-                logs_created += 1
-
-    session.commit()
-
-    return {
-        "message": "Reset giornaliero completato ✅",
-        "compartments_reset": compartments_reset,
-        "logs_created": logs_created
-    }
-
 
 @app.get("/logs/daily-status")
 def get_daily_status(session: Session = Depends(get_session)):
@@ -1402,11 +1277,116 @@ def get_daily_status(session: Session = Depends(get_session)):
 
     return status
 
+@app.get("/logs/aderenza-oggi")
+def adherence_by_compartment(session: Session = Depends(get_session)):
+    today = datetime.now(ZoneInfo("Europe/Rome")).date()
+    result = []
 
-@app.post("/test/reset-compartments-midnight")
-async def test_reset_midnight():
-    """
-    🔁 Test manuale del reset di mezzanotte. Esegue subito la funzione di reset.
-    """
-    await reset_compartments_midnight_async()
-    return {"message": "✅ Reset simulato eseguito con successo."}
+    for comp_num in [1, 2, 3]:
+        logs = session.exec(
+            select(MedicineLog).where(
+                MedicineLog.compartment_number == comp_num,
+                MedicineLog.scheduled_date == today
+            )
+        ).all()
+
+        expected = len([log for log in logs if log.action in ["scheduled", "missed", "taken"]])
+        taken = len([log for log in logs if log.action == "taken"])
+        adherence = round((taken / expected) * 100, 2) if expected else None
+
+        result.append({
+            "compartment": comp_num,
+            "expected_doses": expected,
+            "taken_doses": taken,
+            "percentuale_aderenza": adherence
+        })
+
+    return result
+
+@app.get("/logs/ritardi-medi")
+def average_delay(session: Session = Depends(get_session)):
+    delays = []
+
+    logs = session.exec(
+        select(MedicineLog).where(
+            MedicineLog.action == "taken",
+            MedicineLog.scheduled_time != None,
+            MedicineLog.scheduled_date != None,
+            MedicineLog.taken_at != None
+        )
+    ).all()
+
+    for log in logs:
+        sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time)
+        delay = (log.taken_at - sched_dt).total_seconds() / 60  # in minuti
+        delays.append(delay)
+
+    if delays:
+        return {
+            "average_delay_minutes": round(sum(delays) / len(delays), 2),
+            "max_delay_minutes": max(delays),
+            "min_delay_minutes": min(delays)
+        }
+    else:
+        return {"message": "Nessun log disponibile per il calcolo dei ritardi."}
+
+
+@app.get("/logs/missed-today")
+def get_missed_today(session: Session = Depends(get_session)):
+    today = datetime.now(ZoneInfo("Europe/Rome")).date()    
+    missed = session.exec(
+        select(MedicineLog).where(
+            MedicineLog.action == "missed",
+            MedicineLog.scheduled_date == today
+        )
+    ).all()
+
+    if not missed:
+        return {"message": "Non ci sono medicine missed oggi"}
+
+    low_stock = session.exec(
+        select(Compartment).where(Compartment.low_stock == True)
+    ).all()
+
+    return {
+        "missed_today": len(missed),
+        "compartments_low_stock": [c.compartment_number for c in low_stock],
+        "low_stock_medicines": [c.medicine_name for c in low_stock]
+    }
+
+
+@app.get("/logs/next-medicine")
+def get_next_medicine(session: Session = Depends(get_session)):
+    now = datetime.now(ZoneInfo("Europe/Rome"))
+    today = now.date()
+
+    # Estrai tutte le scheduled di oggi, con orario non nullo e non ancora prese
+    logs = session.exec(
+        select(MedicineLog).where(
+            MedicineLog.scheduled_date == today,
+            MedicineLog.action == "scheduled",
+            MedicineLog.scheduled_time != None
+        )
+    ).all()
+
+    if not logs:
+        return {"message": "Nessunamedicina prevista per oggi"}
+
+    # Trova quella più vicina nel futuro
+    future_logs = [
+        log for log in logs
+        if datetime.combine(log.scheduled_date, log.scheduled_time).replace(tzinfo=ZoneInfo("Europe/Rome")) > now
+    ]
+
+    if not future_logs:
+        return {"message": "Nessuna medicina ancora da prendere oggi"}
+
+    next_log = min(future_logs, key=lambda log: log.scheduled_time)
+
+    return {
+        "next_medicine": {
+            "compartment": next_log.compartment_number,
+            "medicine": next_log.medicine_name,
+            "scheduled_time": next_log.scheduled_time.strftime("%H:%M")
+        }
+    }

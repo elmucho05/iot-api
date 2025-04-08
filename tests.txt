@@ -80,3 +80,125 @@
     }
   }
 ]
+
+
+
+############ bulk-createcompartment
+
+[
+  {
+    "compartment_number": 1,
+    "medicine_name": "Paracetamolo",
+    "number_of_medicines": 6,
+    "to_be_repeated": true,
+    "morning_time": "08:00:00",
+    "afternoon_time": "14:00:00",
+    "evening_time": "20:00:00",
+    "time_if_not_repeated": null
+  },
+  {
+    "compartment_number": 2,
+    "medicine_name": "Ibuprofene",
+    "number_of_medicines": 5,
+    "to_be_repeated": false,
+    "morning_time": null,
+    "afternoon_time": null,
+    "evening_time": null,
+    "time_if_not_repeated": "10:00:00"
+  },
+  {
+    "compartment_number": 3,
+    "medicine_name": "Aspirina",
+    "number_of_medicines": 8,
+    "to_be_repeated": true,
+    "morning_time": "07:30:00",
+    "afternoon_time": null,
+    "evening_time": "21:00:00",
+    "time_if_not_repeated": null
+  }
+]
+
+
+
+
+# @app.post("/logs/update-missed")
+# def update_missed_logs(session: Session = Depends(get_session)):
+#     now = datetime.utcnow()
+
+#     logs = session.exec(
+#         select(MedicineLog).where(
+#             MedicineLog.action == "scheduled",
+#             MedicineLog.scheduled_time != None,
+#             MedicineLog.scheduled_date == now.date()
+#         )
+#     ).all()
+
+#     updated = 0
+#     for log in logs:
+#         sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time).replace(tzinfo=ZoneInfo("Europe/Rome"))
+#         if (now - sched_dt).total_seconds() > 3600:
+#             log.action = "missed"
+#             log.is_late = True
+#             session.add(log)
+#             updated += 1
+
+#     session.commit()
+#     return {"updated_missed": updated}
+
+
+# @app.post("/daily-reset")
+# def reset_medicines_and_schedule(session: Session = Depends(get_session)):
+#     today = datetime.utcnow().date()
+
+#     compartments = session.exec(select(Compartment).where(Compartment.to_be_repeated == True)).all()
+#     logs_created = 0
+#     compartments_reset = 0
+
+#     for comp in compartments:
+#         # Reset dello stato "taken" per ogni medicine ripetibile
+#         comp.taken = False
+#         comp.taken_at = None
+#         session.add(comp)
+#         compartments_reset += 1
+
+#         times = [comp.morning_time, comp.afternoon_time, comp.evening_time]
+#         for sched_time in times:
+#             if not sched_time:
+#                 continue
+
+#             # Evita duplicati
+#             exists = session.exec(select(MedicineLog).where(
+#                 MedicineLog.compartment_number == comp.compartment_number,
+#                 MedicineLog.scheduled_date == today,
+#                 MedicineLog.scheduled_time == sched_time,
+#                 MedicineLog.action == "scheduled"
+#             )).first()
+
+#             if not exists:
+#                 log = MedicineLog(
+#                     compartment_number=comp.compartment_number,
+#                     medicine_name=comp.medicine_name,
+#                     action="scheduled",
+#                     scheduled_time=sched_time,
+#                     scheduled_date=today,
+#                     remaining_pills=comp.number_of_medicines,
+#                     low_stock=comp.number_of_medicines < 4
+#                 )
+#                 session.add(log)
+#                 logs_created += 1
+
+#     session.commit()
+
+#     return {
+#         "message": "Reset giornaliero completato ✅",
+#         "compartments_reset": compartments_reset,
+#         "logs_created": logs_created
+#     }
+
+@app.post("/test/reset-compartments-midnight")
+async def test_reset_midnight():
+    """
+    🔁 Test manuale del reset di mezzanotte. Esegue subito la funzione di reset.
+    """
+    await reset_compartments_midnight_async()
+    return {"message": "✅ Reset simulato eseguito con successo."}
