@@ -23,6 +23,8 @@ import httpx
 import configparser
 from zoneinfo import ZoneInfo
 
+import threading
+
 
 # Database Configuration
 sqlite_file_name = "medicine_db.db"
@@ -132,6 +134,8 @@ if not config.has_section("HTTPAIO"):
 url = config.get("HTTPAIO", "Url")
 aio_key = config.get("HTTPAIO", "X-AIO-Key")
 
+
+
 def post_to_adafruit(compartment_index: int, value: int):
     if compartment_index > 2:
         return
@@ -155,10 +159,13 @@ def post_to_adafruit(compartment_index: int, value: int):
     except Exception as e:
         print(f"❌ POST error: {e}")
 
+def async_post_to_adafruit(compartment_index: int, value: int):
+    thread = threading.Thread(target=post_to_adafruit, args=(compartment_index, value))
+    thread.start()
 
 def check_scheduled_logs():
     with Session(engine) as session:
-        now = datetime.utcnow()
+        now = datetime.now(ZoneInfo("Europe/Rome"))  # 🇮🇹 orario italiano corretto
         logs = session.exec(
             select(MedicineLog).where(
                 MedicineLog.action == "scheduled",
@@ -170,8 +177,11 @@ def check_scheduled_logs():
         updated = 0
 
         for log in logs:
-            sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time)
+            sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time).replace(tzinfo=ZoneInfo("Europe/Rome"))
+            print("tempo estratto dai logs", sched_dt)
+            print("tempo ora", now)
             seconds_since_sched = (now - sched_dt).total_seconds()
+            print("tempo passato da quando è stato schedulato : ", seconds_since_sched)
             seconds_to_sched = (sched_dt - now).total_seconds()
 
             # ✅ Controlla se è da marcare come missed (ritardo > 90 minuti)
@@ -181,9 +191,9 @@ def check_scheduled_logs():
                 session.add(log)
                 updated += 1
                 print(f"❌ Log {log.id} marcato come missed (ritardo > 90 min)")
-
+            print("printing the seconds up to a medicine", seconds_to_sched)
             # ✅ Trigger Adafruit se è previsto entro 10 minuti
-            if 0 <= seconds_to_sched <= 600:
+            if 0 <= seconds_to_sched <= 650:
                 print(f"🔔 Medicinale previsto entro 10 minuti (log {log.id})")
 
                 comp = session.exec(
@@ -193,20 +203,23 @@ def check_scheduled_logs():
                 if comp:
                     comp.taken = False
                     session.add(comp)
-                    post_to_adafruit(comp.compartment_number - 1, 0)
-                    print(f"📤 Comando inviato ad Adafruit per compartimento {comp.compartment_number}")
+
+                    # 🔁 Chiamata in thread separato
+                    async_post_to_adafruit(comp.compartment_number - 1, 0)
+                    print(f"📤 Comando (threaded) inviato ad Adafruit per compartimento {comp.compartment_number}")
 
         session.commit()
 
         if updated:
             print(f"[✔] Logs aggiornati: {updated} medicine marcate come missed")
 
+
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(check_scheduled_logs, IntervalTrigger(minutes=1))
-    scheduler.start()
+    # scheduler = BackgroundScheduler()
+    # scheduler.add_job(check_scheduled_logs, IntervalTrigger(minutes=1))
+    # scheduler.start()
 
 
 # API Endpoints
