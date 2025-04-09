@@ -216,7 +216,7 @@ async def periodic_check_loop():
             await check_scheduled_logs_async()
         except Exception as e:
             print(f"❌ Errore nel cron async: {e}")
-        await asyncio.sleep(30)  # ogni 30 secondi
+        await asyncio.sleep(300)  # ogni 30 secondi
 
 
 async def reset_compartments_midnight_async():
@@ -238,9 +238,9 @@ async def reset_compartments_midnight_async():
             }
             for comp in compartments
         ]
-
+    #FIXME TO THE SERVER
     # ✅ Ora puoi lavorare con questi dati fuori dalla sessione
-    async with AsyncClient(base_url="http://localhost:8000") as async_client:
+    async with AsyncClient(base_url="http://localhost:8888") as async_client:
         for payload in compartments_data:
             comp_number = payload["compartment_number"]
 
