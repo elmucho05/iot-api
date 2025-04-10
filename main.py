@@ -216,7 +216,7 @@ async def periodic_check_loop():
             await check_scheduled_logs_async()
         except Exception as e:
             print(f"❌ Errore nel cron async: {e}")
-        await asyncio.sleep(300)  # ogni 30 secondi
+        await asyncio.sleep(300)  # ogni 5 minuti, 300 secondi / 60 = 5 minuti
 
 
 async def reset_compartments_midnight_async():
@@ -240,7 +240,7 @@ async def reset_compartments_midnight_async():
         ]
     #FIXME TO THE SERVER
     # ✅ Ora puoi lavorare con questi dati fuori dalla sessione
-    async with AsyncClient(base_url="http://localhost:8888") as async_client:
+    async with AsyncClient(base_url="http://0.0.0.0:8888") as async_client:
         for payload in compartments_data:
             comp_number = payload["compartment_number"]
 
@@ -257,6 +257,25 @@ async def reset_compartments_midnight_async():
                 print(f"✅ Compartimento {comp_number} ricreato con successo")
             else:
                 print(f"❌ Errore nel ricreare compartimento {comp_number}: {res.status_code} - {res.text}")
+
+# async def wait_for_2_minutes():
+#     await asyncio.sleep(5)  # Just a slight initial wait before starting
+#     while True:
+#         # Get the current time and calculate the time for 2 minutes from now
+#         now = datetime.now(ZoneInfo("Europe/Rome"))
+#         two_minutes_later = now + timedelta(minutes=2)
+        
+#         # Calculate the remaining seconds until 2 minutes from now
+#         seconds_to_wait = (two_minutes_later - now).total_seconds()
+
+#         print(f"[⏳] Prossimo reset in {seconds_to_wait:.0f} secondi (2 minuti da ora)")
+#         await asyncio.sleep(seconds_to_wait)  # Sleep for the calculated time
+
+#         try:
+#             # Reset compartments after 2 minutes
+#             await reset_compartments_midnight_async()
+#         except Exception as e:
+#             print(f"❌ Errore nel reset dopo 2 minuti: {e}")
 
 async def wait_until_midnight_loop():
     await asyncio.sleep(5)
@@ -280,7 +299,7 @@ def on_startup():
     create_db_and_tables()
     asyncio.create_task(periodic_check_loop())
     asyncio.create_task(wait_until_midnight_loop())
-
+    ##asyncio.create_task(wait_for_2_minutes())
 
 
 # API Endpoints
@@ -449,13 +468,16 @@ def bulk_create_compartments(
 
     return created
 
-
-@app.patch("/compartments/updatecompartment/{compartment_id}", response_model=CompartmentPublic)
-def update_compartment(compartment_id: int, compartment_update: CompartmentUpdate, session: Session = Depends(get_session)):
-    compartment = session.get(Compartment, compartment_id)
+@app.patch("/compartments/updatecompartment/{compartment_number}", response_model=CompartmentPublic)
+def update_compartment(compartment_number: int, compartment_update: CompartmentUpdate, session: Session = Depends(get_session)):
+    # Find the compartment by its compartment_number
+    compartment = session.exec(
+        select(Compartment).where(Compartment.compartment_number == compartment_number)
+    ).first()
+    
     if not compartment:
         raise HTTPException(status_code=404, detail="Compartment not found")
-
+    
     original_name = compartment.medicine_name
     update_data = compartment_update.model_dump(exclude_unset=True)
 
@@ -473,7 +495,7 @@ def update_compartment(compartment_id: int, compartment_update: CompartmentUpdat
     session.commit()
     session.refresh(compartment)
 
-    # ✅ Aggiorna i log associati
+    # ✅ Update associated logs
     related_logs = session.exec(
         select(MedicineLog).where(
             MedicineLog.compartment_number == compartment.compartment_number,
@@ -489,7 +511,7 @@ def update_compartment(compartment_id: int, compartment_update: CompartmentUpdat
 
         if log.action in ["scheduled", "missed", "taken"]:
             if log.scheduled_time:
-                # Aggiorna l'orario del log se cambiano i time slot
+                # Update log time if time slots are changed
                 if not compartment.to_be_repeated:
                     new_time = update_data.get("time_if_not_repeated")
                     if new_time:
@@ -505,13 +527,13 @@ def update_compartment(compartment_id: int, compartment_update: CompartmentUpdat
                     if new_time:
                         log.scheduled_time = new_time
 
-            # Ripristina il log "missed" a "scheduled" se il nuovo orario è ancora valido
+            # Restore 'missed' log to 'scheduled' if the new time is still valid
             if log.action == "missed" and log.scheduled_time:
                 sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time).replace(tzinfo=ZoneInfo("Europe/Rome"))
                 if (now - sched_dt).total_seconds() <= 5400:
                     log.action = "scheduled"
                     log.is_late = False
-                    print(f"✅ Log {log.id} ripristinato da 'missed' a 'scheduled'")
+                    print(f"✅ Log {log.id} restored from 'missed' to 'scheduled'")
 
             if log.action == "scheduled":
                 log.remaining_pills = update_data.get("number_of_medicines", log.remaining_pills)
@@ -520,6 +542,7 @@ def update_compartment(compartment_id: int, compartment_update: CompartmentUpdat
 
     session.commit()
     return compartment
+
 
 
 
@@ -1390,3 +1413,11 @@ def get_next_medicine(session: Session = Depends(get_session)):
             "scheduled_time": next_log.scheduled_time.strftime("%H:%M")
         }
     }
+
+@app.post("/test/reset-compartments-midnight")
+async def test_reset_midnight():
+    """
+    🔁 Test manuale del reset di mezzanotte. Esegue subito la funzione di reset.
+    """
+    await reset_compartments_midnight_async()
+    return {"message": "✅ Reset simulato eseguito con successo."}
