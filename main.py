@@ -1678,69 +1678,89 @@ async def test_reset_midnight():
     return {"message": "✅ Reset simulato eseguito con successo."}
 
 
+def normalize_time(t: time) -> str:
+    return t.replace(microsecond=0).strftime('%H:%M:%S') if t else None
+
 @app.get("/logs/daily-status/everyday")
 def get_everyday_daily_status(session: Session = Depends(get_session), device_assigned: Optional[str] = None):
     now = datetime.now(ZoneInfo("Europe/Rome"))
     today = now.date()
-
-    week_start_date = today - timedelta(days=7)
+    week_start_date = today - timedelta(days=6)
 
     compartments = session.exec(select(Compartment)).all()
     status_by_date = defaultdict(list)
 
     for comp in compartments:
-        # Filter by device_assigned if provided
         if device_assigned and comp.device_assigned != device_assigned:
             continue
 
         logs = session.exec(
             select(MedicineLog).where(
                 MedicineLog.compartment_number == comp.compartment_number,
-                MedicineLog.scheduled_date >= week_start_date,  # Logs from the last 7 days
-                MedicineLog.scheduled_date <= today  # Up to today
+                MedicineLog.scheduled_date >= week_start_date,
+                MedicineLog.scheduled_date <= today
             )
         ).all()
 
-        log_map = {
-            log.scheduled_time: log.action + (" (late)" if log.is_late else "")
-            for log in logs
+        logs_by_date = defaultdict(dict)
+        for log in logs:
+            time_str = normalize_time(log.scheduled_time)
+            logs_by_date[log.scheduled_date][time_str] = "taken" if log.taken_at else log.action
+            print(f"[LOG INSERTED] date={log.scheduled_date} time={time_str} status={'taken' if log.taken_at else log.action}")
+
+        for i in range(7):
+            date_to_check = today - timedelta(days=i)
+            logs_for_day = logs_by_date.get(date_to_check, {})
+
+            if comp.to_be_repeated:
+                morning_key = normalize_time(comp.morning_time)
+                afternoon_key = normalize_time(comp.afternoon_time)
+                evening_key = normalize_time(comp.evening_time)
+
+                if morning_key and morning_key not in logs_for_day:
+                    print(f"[MISS] Morning not found for {date_to_check} - comp {comp.compartment_number} - expected {morning_key}")
+                if afternoon_key and afternoon_key not in logs_for_day:
+                    print(f"[MISS] Afternoon not found for {date_to_check} - comp {comp.compartment_number} - expected {afternoon_key}")
+                if evening_key and evening_key not in logs_for_day:
+                    print(f"[MISS] Evening not found for {date_to_check} - comp {comp.compartment_number} - expected {evening_key}")
+
+                status_by_date[date_to_check].append({
+                    "compartment": comp.compartment_number,
+                    "medicine": comp.medicine_name,
+                    "total_to_take": len([t for t in [comp.morning_time, comp.afternoon_time, comp.evening_time] if t]),
+                    "morning": logs_for_day.get(morning_key, "not scheduled") if comp.morning_time else "not scheduled",
+                    "afternoon": logs_for_day.get(afternoon_key, "not scheduled") if comp.afternoon_time else "not scheduled",
+                    "evening": logs_for_day.get(evening_key, "not scheduled") if comp.evening_time else "not scheduled"
+                })
+            else:
+                time_str = normalize_time(comp.time_if_not_repeated)
+
+                if time_str and time_str not in logs_for_day:
+                    print(f"[MISS] Single-time not found for {date_to_check} - comp {comp.compartment_number} - expected {time_str}")
+
+                status_by_date[date_to_check].append({
+                    "compartment": comp.compartment_number,
+                    "medicine": comp.medicine_name,
+                    "total_to_take": 1,
+                    "scheduled_time": time_str,
+                    "status": logs_for_day.get(time_str, "not scheduled") if time_str else "not scheduled"
+                })
+
+    return [
+        {
+            "date": str(date),
+            "status": status
         }
-
-        for date in range(7): 
-            date_to_check = today - timedelta(days=date)
-            if date_to_check in [log.scheduled_date for log in logs]:
-
-                if comp.to_be_repeated:
-                    status_by_date[date_to_check].append({
-                        "compartment": comp.compartment_number,
-                        "medicine": comp.medicine_name,
-                        "total_to_take": len([t for t in [comp.morning_time, comp.afternoon_time, comp.evening_time] if t]),
-                        "morning": log_map.get(comp.morning_time, "not scheduled"),
-                        "afternoon": log_map.get(comp.afternoon_time, "not scheduled"),
-                        "evening": log_map.get(comp.evening_time, "not scheduled")
-                    })
-                else:
-                    status_by_date[date_to_check].append({
-                        "compartment": comp.compartment_number,
-                        "medicine": comp.medicine_name,
-                        "total_to_take": 1,
-                        "scheduled_time": comp.time_if_not_repeated,
-                        "status": log_map.get(comp.time_if_not_repeated, "not scheduled")
-                    })
-
-    return [{"date": str(date), "status": status} for date, status in status_by_date.items()]
+        for date, status in sorted(status_by_date.items(), reverse=True)
+    ]
 
 
 @app.get("/logs/most-forgotten-medicine")
-def most_forgotten_medicine(session: Session = Depends(get_session), device_assigned: Optional[str] = None):
+def most_forgotten_medicine(session: Session = Depends(get_session)):
     # Query for missed logs
     missed_logs = session.exec(
         select(MedicineLog).where(MedicineLog.action == "missed")
     ).all()
-
-    # Filter missed logs by device_assigned if provided
-    if device_assigned:
-        missed_logs = [log for log in missed_logs if log.device_name == device_assigned]
 
     # Create a Counter to count missed medicines
     missed_count = Counter(log.medicine_name for log in missed_logs)
@@ -1754,3 +1774,5 @@ def most_forgotten_medicine(session: Session = Depends(get_session), device_assi
         }
     else:
         return {"message": "No missed medicines found."}
+
+
