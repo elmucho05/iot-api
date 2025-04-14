@@ -28,6 +28,8 @@ from zoneinfo import ZoneInfo
 
 import threading
 from fastapi.testclient import TestClient
+from collections import Counter
+
 
 # Database Configuration
 sqlite_file_name = "medicine_db.db"
@@ -56,6 +58,8 @@ class CompartmentBase(SQLModel):
     taken : bool= Field(default=False)
     taken_at : Optional[datetime] = None
     low_stock: bool = Field(default=False)
+    device_assigned: Optional[str] = Field(default="device1")  # Default device to 'device1'
+
 
 class Compartment(CompartmentBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -81,6 +85,12 @@ class CompartmentUpdate(SQLModel):
 class CompartmentPublic(CompartmentBase):
     id: int
 
+class CompartmentDevice1(CompartmentBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+class CompartmentDevice2(CompartmentBase, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    
 class AdafruitData(BaseModel):
     value: str
     feed_name: str
@@ -96,13 +106,15 @@ class MedicineLog(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     compartment_number: int
     medicine_name: str
-    taken_at: Optional[datetime] = None  # This can be time of action (taken/refill/manual)
-    action: str = Field(default="taken")  # "taken", "refill", "manual" "scheduled"
+    taken_at: Optional[datetime] = None  # Time of action (taken, refill, manual)
+    action: str = Field(default="taken")  # "taken", "refill", "manual", "scheduled"
     remaining_pills: Optional[int] = None
     low_stock: Optional[bool] = None
-    scheduled_time: Optional[time] = None  # when it was supposed to be taken
+    scheduled_time: Optional[time] = None  # When it was supposed to be taken
     is_late: Optional[bool] = None
     scheduled_date: Optional[date] = None
+    device_name: Optional[str] = None  # Track which device the log is associated with
+
 
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
@@ -140,16 +152,19 @@ url = config.get("HTTPAIO", "Url")
 aio_key = config.get("HTTPAIO", "X-AIO-Key")
 
 
-
-async def post_to_adafruit_async(compartment_index: int, value: int):
-    if compartment_index > 2:
-        return
+async def post_to_adafruit_async(compartment_index: int, value: int, is_device_failure: bool = False):
+    # If device failure flag is set, send the value to the 'device1-failed' feed
+    if is_device_failure:
+        feed_key = "device1-failed"  # Use a dedicated feed for device failure
+    else:
+        if compartment_index > 2:
+            return
+        feed_key = f"Feed{compartment_index + 1}"  # Use compartment feed based on index
 
     config = configparser.ConfigParser()
     config.read('config.ini')
     url = config.get("HTTPAIO", "Url")
     aio_key = config.get("HTTPAIO", "X-AIO-Key")
-    feed_key = f"Feed{compartment_index + 1}"
     feed = config.get("HTTPAIO", feed_key)
 
     full_url = f"{url}{feed}/data"
@@ -198,11 +213,11 @@ async def check_scheduled_logs_async():
                 comp = session.exec(
                     select(Compartment).where(Compartment.compartment_number == log.compartment_number)
                 ).first()
-
+                
                 if comp:
                     comp.taken = False
                     session.add(comp)
-                    await post_to_adafruit_async(comp.compartment_number - 1, 0)
+                    await post_to_adafruit_async(comp.compartment_number - 1, 0)  # Post to the respective compartment feed
                     print(f"📤 Comando async inviato ad Adafruit per compartimento {comp.compartment_number}")
 
         session.commit()
@@ -216,7 +231,8 @@ async def periodic_check_loop():
             await check_scheduled_logs_async()
         except Exception as e:
             print(f"❌ Errore nel cron async: {e}")
-        await asyncio.sleep(300)  # ogni 5 minuti, 300 secondi / 60 = 5 minuti
+        await asyncio.sleep(30)  # ogni 5 minuti, 300 secondi / 60 = 5 minuti
+
 
 
 async def reset_compartments_midnight_async():
@@ -229,16 +245,17 @@ async def reset_compartments_midnight_async():
             {
                 "compartment_number": comp.compartment_number,
                 "medicine_name": comp.medicine_name,
-                "number_of_medicines": comp.number_of_medicines,
+                "number_of_medicines": comp.number_of_medicines,  # Reset number of medicines here
                 "to_be_repeated": comp.to_be_repeated,
                 "morning_time": comp.morning_time.isoformat() if comp.morning_time else None,
                 "afternoon_time": comp.afternoon_time.isoformat() if comp.afternoon_time else None,
                 "evening_time": comp.evening_time.isoformat() if comp.evening_time else None,
-                "time_if_not_repeated": comp.time_if_not_repeated.isoformat() if comp.time_if_not_repeated else None
+                "time_if_not_repeated": comp.time_if_not_repeated.isoformat() if comp.time_if_not_repeated else None,
+                "device_assigned": comp.device_assigned  # Keep device assignment intact
             }
             for comp in compartments
         ]
-    #FIXME TO THE SERVER
+    
     # ✅ Ora puoi lavorare con questi dati fuori dalla sessione
     async with AsyncClient(base_url="http://0.0.0.0:8888") as async_client:
         for payload in compartments_data:
@@ -257,6 +274,8 @@ async def reset_compartments_midnight_async():
                 print(f"✅ Compartimento {comp_number} ricreato con successo")
             else:
                 print(f"❌ Errore nel ricreare compartimento {comp_number}: {res.status_code} - {res.text}")
+
+
 
 # async def wait_for_2_minutes():
 #     await asyncio.sleep(5)  # Just a slight initial wait before starting
@@ -303,11 +322,11 @@ def on_startup():
 
 
 # API Endpoints
-
 @app.post("/compartments/createcompartment", response_model=CompartmentPublic)
 def create_compartment(compartment: CompartmentCreate, session: Session = Depends(get_session)):
     """
     Creates a new medicine in a compartment and automatically adds 'scheduled' logs for today.
+    Also creates entries in both CompartmentDevice1 and CompartmentDevice2 (both devices with identical data).
     """
     if compartment.compartment_number not in [1, 2, 3]:
         raise HTTPException(
@@ -334,15 +353,51 @@ def create_compartment(compartment: CompartmentCreate, session: Session = Depend
             detail="time_if_not_repeated should be None if the medicine is repeated."
         )
 
+    # Create the Compartment record
     db_compartment = Compartment.model_validate(compartment)
     db_compartment.low_stock = db_compartment.number_of_medicines < 4  # auto-calculate stock status
     session.add(db_compartment)
     session.commit()
     session.refresh(db_compartment)
 
+    # Create entries in both devices (CompartmentDevice1 and CompartmentDevice2)
+    device1_compartment = CompartmentDevice1(
+        compartment_number=db_compartment.compartment_number,
+        medicine_name=db_compartment.medicine_name,
+        number_of_medicines=db_compartment.number_of_medicines,  # Same initial number of medicines
+        to_be_repeated=db_compartment.to_be_repeated,
+        morning_time=db_compartment.morning_time,
+        afternoon_time=db_compartment.afternoon_time,
+        evening_time=db_compartment.evening_time,
+        time_if_not_repeated=db_compartment.time_if_not_repeated,
+        taken=db_compartment.taken,
+        taken_at=db_compartment.taken_at,
+        low_stock=db_compartment.low_stock,
+        device_assigned="device1"  # Assigned to Device 1
+    )
+
+    device2_compartment = CompartmentDevice2(
+        compartment_number=db_compartment.compartment_number,
+        medicine_name=db_compartment.medicine_name,
+        number_of_medicines=db_compartment.number_of_medicines,  # Same initial number of medicines
+        to_be_repeated=db_compartment.to_be_repeated,
+        morning_time=db_compartment.morning_time,
+        afternoon_time=db_compartment.afternoon_time,
+        evening_time=db_compartment.evening_time,
+        time_if_not_repeated=db_compartment.time_if_not_repeated,
+        taken=db_compartment.taken,
+        taken_at=db_compartment.taken_at,
+        low_stock=db_compartment.low_stock,
+        device_assigned="device2"  # Assigned to Device 2
+    )
+
+    session.add(device1_compartment)
+    session.add(device2_compartment)
+    session.commit()
+
     # 🔁 CREAZIONE AUTOMATICA LOG SCHEDULED
-    today = datetime.utcnow().date()
-    
+    today = datetime.now(ZoneInfo("Europe/Rome")).date()
+
     def create_log(sched_time: time):
         return MedicineLog(
             compartment_number=db_compartment.compartment_number,
@@ -353,6 +408,7 @@ def create_compartment(compartment: CompartmentCreate, session: Session = Depend
             low_stock=db_compartment.low_stock,
             scheduled_time=sched_time,
             scheduled_date=today,
+            device_name="device1",
             is_late=False
         )
 
@@ -365,6 +421,7 @@ def create_compartment(compartment: CompartmentCreate, session: Session = Depend
         session.add(create_log(db_compartment.time_if_not_repeated))
 
     session.commit()
+
     return db_compartment
 
 
@@ -373,14 +430,20 @@ def create_compartment(compartment: CompartmentCreate, session: Session = Depend
 def get_compartments(
     session: Session = Depends(get_session),
     offset: int = 0,
-    limit: int = Query(100, le=100)
+    limit: int = Query(100, le=100),
+    device_assigned: Optional[str] = None  # Optional device filter
 ):
-    compartments = session.exec(select(Compartment).offset(offset).limit(limit)).all()
+    query = select(Compartment).offset(offset).limit(limit)
+    
+    if device_assigned:
+        query = query.where(Compartment.device_assigned == device_assigned)
+
+    compartments = session.exec(query).all()
     return compartments
 
 
 @app.get("/compartments/{compartment_number}", response_model=List[CompartmentPublic])
-def get_compartments_by_number(compartment_number: int, session: Session = Depends(get_session)):
+def get_compartments_by_number(compartment_number: int, device_assigned: Optional[str] = None, session: Session = Depends(get_session)):
     """
     Get all medicines stored in a specific compartment (1, 2, or 3).
     """
@@ -389,8 +452,13 @@ def get_compartments_by_number(compartment_number: int, session: Session = Depen
             status_code=400,
             detail="compartment_number must be 1, 2, or 3."
         )
+    query = select(Compartment).where(Compartment.compartment_number == compartment_number)
 
-    compartments = session.exec(select(Compartment).where(Compartment.compartment_number == compartment_number)).all()
+    if device_assigned:
+        # Filter by device if specified
+        query = query.where(Compartment.device_assigned == device_assigned)
+
+    compartments = session.exec(query).all()
     return compartments
 
 @app.post("/compartments/bulk-create", response_model=List[CompartmentPublic])
@@ -488,8 +556,19 @@ def update_compartment(compartment_number: int, compartment_update: CompartmentU
             detail="compartment_number must be 1, 2, or 3."
         )
 
+    # We don't want to change the device once it's set, unless explicitly required
+    if "device_assigned" in update_data and update_data["device_assigned"] != compartment.device_assigned:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot change the device_assigned once it is set."
+        )
+
+    # Update the compartment fields
     for key, value in update_data.items():
         setattr(compartment, key, value)
+
+    # Mark compartment as low stock if medicines are less than 4
+    compartment.low_stock = compartment.number_of_medicines < 4
 
     session.add(compartment)
     session.commit()
@@ -545,8 +624,6 @@ def update_compartment(compartment_number: int, compartment_update: CompartmentU
 
 
 
-
-
 @app.delete("/compartments/{compartment_number}")
 def delete_medicine_from_compartment(
     compartment_number: int,
@@ -554,6 +631,7 @@ def delete_medicine_from_compartment(
 ):
     """
     Deletes all entries of a specific medicine from a given compartment.
+    It deletes the compartment for all devices.
     """
     if compartment_number not in [1, 2, 3]:
         raise HTTPException(
@@ -561,28 +639,31 @@ def delete_medicine_from_compartment(
             detail="compartment_number must be 1, 2, or 3."
         )
 
-    # Check existence first
-    exists = session.exec(
-        select(Compartment).where(
-            (Compartment.compartment_number == compartment_number))
+    # Check existence of the compartment for both devices
+    compartment = session.exec(
+        select(Compartment).where(Compartment.compartment_number == compartment_number)
     ).first()
 
-    if not exists:
+    if not compartment:
         raise HTTPException(
             status_code=404,
             detail=f"No medicine found in compartment {compartment_number}."
         )
 
-    # Efficient bulk delete
+    # Delete from both devices (compartment entries in both device tables)
+    session.exec(delete(Compartment).where(Compartment.compartment_number == compartment_number))
+    
+    # Commit changes to the compartments
+    session.commit()
+
+    # Remove associated medicine logs related to this compartment
     session.exec(
-        delete(Compartment).where(
-            (Compartment.compartment_number == compartment_number)
-        )
+        delete(MedicineLog).where(MedicineLog.compartment_number == compartment_number)
     )
     session.commit()
 
     return {
-        "message": f"All entries of '{compartment_number}' have been removed."
+        "message": f"All entries of compartment {compartment_number} have been removed from all devices."
     }
 
 @app.delete("/compartments/")
@@ -699,9 +780,6 @@ def get_pending_medicines(
 #################################################################
 ###################### Adafruit stuff ###########################
 #################################################################
-# ✅ Update webhook to UPDATE the existing scheduled log instead of creating new one
-from zoneinfo import ZoneInfo
-
 @app.post("/adafruit-taken-webhook/")
 def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_session)):
     for entry in data:
@@ -709,29 +787,74 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
         feed_map = {
             "comp1-taken": 1,
             "comp2-taken": 2,
-            "comp3-taken": 3  # 🔧 sistemato: era 31 per errore
+            "comp3-taken": 3  # Corrected from 31 to 3 for feed
         }
         comp_num = feed_map.get(feed)
         if not comp_num:
             continue
 
+        # Fetch the compartment for the given feed
         comp = session.exec(
             select(Compartment).where(Compartment.compartment_number == comp_num)
         ).first()
+        
         if not comp:
             continue
 
+        # Check if device_assigned is set, if not default to "device1"
+        device_assigned = comp.device_assigned if comp.device_assigned else "device1"
+
         if entry.value.strip() == "1":
-            # 🇮🇹 Converte in orario italiano
+            # 🇮🇹 Convert to Italian time
             taken_time = parser.isoparse(entry.created_at).astimezone(ZoneInfo("Europe/Rome"))
 
-            # ✅ Aggiorna compartimento
+            # Update compartment based on device_assigned
             comp.taken = True
             comp.taken_at = taken_time
-            comp.number_of_medicines = max(comp.number_of_medicines - 1, 0)
+
+            # Decrement number of medicines based on the device
+            if device_assigned == "device1":
+                # Update CompartmentDevice1
+                device1_compartment = session.exec(
+                    select(CompartmentDevice1).where(CompartmentDevice1.compartment_number == comp_num)
+                ).first()
+
+                if device1_compartment:
+                    device1_compartment.number_of_medicines = max(device1_compartment.number_of_medicines - 1, 0)
+                    session.add(device1_compartment)
+                    session.commit()
+                    session.refresh(device1_compartment)
+
+                    # Now update the Compartment's number_of_medicines
+                    comp.number_of_medicines = device1_compartment.number_of_medicines
+                else:
+                    # Handle case where device1 compartment does not exist
+                    pass
+
+            elif device_assigned == "device2":
+                # Find the compartment on device 2
+                device2_compartment = session.exec(
+                    select(CompartmentDevice2).where(
+                        CompartmentDevice2.compartment_number == comp_num
+                    )
+                ).first()
+
+                if device2_compartment:
+                    device2_compartment.number_of_medicines = max(device2_compartment.number_of_medicines - 1, 0)
+                    session.add(device2_compartment)
+                    session.commit()
+                    session.refresh(device2_compartment)
+
+                    # Now update the Compartment's number_of_medicines
+                    comp.number_of_medicines = device2_compartment.number_of_medicines
+                else:
+                    # Handle case where device 2 compartment does not exist
+                    pass
+
+            # Update low stock status
             comp.low_stock = comp.number_of_medicines < 4
 
-            # ✅ Cerca log "scheduled" corrispondente per oggi
+            # Search for the corresponding "scheduled" log for today
             scheduled_logs = session.exec(
                 select(MedicineLog).where(
                     MedicineLog.compartment_number == comp.compartment_number,
@@ -747,11 +870,11 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
                     sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time).replace(tzinfo=ZoneInfo("Europe/Rome"))
                     diff = abs((taken_time - sched_dt).total_seconds())
 
-                    if diff <= 1200:  # entro 20 minuti
+                    if diff <= 1800:  # within 20 minutes
                         matched_log = log
                         matched_log.is_late = False
                         break
-                    elif diff <= 3600:  # entro 1 ora (in ritardo)
+                    elif diff <= 3600:  # within 1 hour (late)
                         matched_log = log
                         matched_log.is_late = True
                         break
@@ -761,9 +884,10 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
                 matched_log.taken_at = taken_time
                 matched_log.remaining_pills = comp.number_of_medicines
                 matched_log.low_stock = comp.low_stock
+                matched_log.device_name = comp.device_assigned
                 session.add(matched_log)
             else:
-                # Nessun log entro i limiti → fallback: marca il più vicino come "missed"
+                # No log within time limits → fallback: mark the closest as "missed"
                 if scheduled_logs:
                     fallback = min(
                         scheduled_logs,
@@ -774,6 +898,8 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
                     fallback.remaining_pills = comp.number_of_medicines
                     fallback.low_stock = comp.low_stock
                     fallback.is_late = True
+                    fallback.device_name = comp.device_assigned
+
                     session.add(fallback)
 
             session.add(comp)
@@ -788,6 +914,65 @@ def pill_taken_webhook(data: List[AdafruitData], session: Session = Depends(get_
 
     return {"message": "❌ Nessun aggiornamento valido ricevuto."}
 
+@app.post("/device-failed-webhook/")
+def handle_device_failure(data: List[AdafruitData], session: Session = Depends(get_session)):
+    """
+    This route is triggered by the webhook from Adafruit, where a failure in device1 is reported.
+    It reassigns compartments to device2 in case device1 fails.
+    """
+    for entry in data:
+        # Check if the failure signal comes from the device1-failed feed
+        if entry.feed_name == "device1-failed":
+            # If device1 failed, its value will be 1
+            if entry.value.strip() == "1":
+                print("Device 1 has failed, reassigning compartments to Device 2.")
+
+                # Reassign compartments that were assigned to device1 to device2
+                compartments = session.exec(
+                    select(Compartment).where(Compartment.device_assigned == "device1")
+                ).all()
+
+                # If no compartments are found, log and exit
+                if not compartments:
+                    print("No compartments assigned to Device 1.")
+                    continue
+
+                # Update each compartment's device_assigned field to "device2"
+                for comp in compartments:
+                    comp.device_assigned = "device2"
+                    session.add(comp)
+
+                # Commit the changes to the database
+                session.commit()
+
+                print(f"✅ Compartments reassigned to Device 2: {', '.join(str(comp.compartment_number) for comp in compartments)}")
+            elif entry.value.strip() == "0":
+                print("Device 1 is back online, reassigning compartments back to Device 1.")
+
+                # Reassign compartments that were assigned to device2 back to device1
+                compartments = session.exec(
+                    select(Compartment).where(Compartment.device_assigned == "device2")
+                ).all()
+
+                # If no compartments are found, log and exit
+                if not compartments:
+                    print("No compartments assigned to Device 2.")
+                    continue
+
+                # Update each compartment's device_assigned field to "device1"
+                for comp in compartments:
+                    comp.device_assigned = "device1"
+                    session.add(comp)
+
+                # Commit the changes to the database
+                session.commit()
+
+                print(f"✅ Compartments reassigned back to Device 1: {', '.join(str(comp.compartment_number) for comp in compartments)}")
+            else:
+                print("Invalid failure signal received. Expected 1 or 0.")
+        else:
+            print(f"Ignoring feed: {entry.feed_name}, as it is not a device failure signal.")
+    return {"message": "✅ Device failure handled and compartments reassigned appropriately."}
 
 @app.post("/compartments/{compartment_number}/refill")
 def refill_medicine(compartment_number: int, refill: RefillRequest, session: Session = Depends(get_session)):
@@ -954,34 +1139,53 @@ def populate_test_data(session: Session = Depends(get_session)):
 
 
 ###################### LOGS ####################
+
 @app.get("/logs/", response_model=List[MedicineLog])
-def get_all_logs(session: Session = Depends(get_session)):
-    return session.exec(
-        select(MedicineLog).order_by(MedicineLog.scheduled_date.desc(), MedicineLog.taken_at.desc())
-    ).all()
+def get_all_logs(session: Session = Depends(get_session), device_assigned: Optional[str] = None):
+    """
+    Fetch all logs, optionally filtering by the device assigned.
+    If device_assigned is provided, only logs from that device will be returned.
+    """
+    query = session.exec(select(MedicineLog).order_by(MedicineLog.scheduled_date.desc(), MedicineLog.taken_at.desc()))
+    
+    if device_assigned:
+        query = query.where(MedicineLog.device_name == device_assigned)  # Filter by device_assigned
+    
+    return query.all()
 
 @app.get("/logs/by-day/{date}", response_model=List[MedicineLog])
-def get_logs_by_day(date: str, session: Session = Depends(get_session)):
+def get_logs_by_day(date: str, session: Session = Depends(get_session), device_assigned: Optional[str] = None):
+    """
+    Fetch logs for a specific day, optionally filtered by the device assigned.
+    """
     try:
         day_start = datetime.fromisoformat(date).date()
     except:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
-
-    logs = session.exec(
+    
+    query = session.exec(
         select(MedicineLog).where(MedicineLog.scheduled_date == day_start).order_by(MedicineLog.scheduled_time)
-    ).all()
-
-    return logs
-
+    )
+    
+    if device_assigned:
+        query = query.where(MedicineLog.device_name == device_assigned)  # Filter by device_assigned
+    
+    return query.all()
 
 @app.get("/logs/by-compartment")
-def get_log_summary(session: Session = Depends(get_session)):
+def get_log_summary(session: Session = Depends(get_session), device_assigned: Optional[str] = None):
+    """
+    Get log summary for each compartment, optionally filtering by the device assigned.
+    """
     summary = []
 
     for comp_num in [1, 2, 3]:
-        logs = session.exec(
-            select(MedicineLog).where(MedicineLog.compartment_number == comp_num)
-        ).all()
+        query = session.exec(select(MedicineLog).where(MedicineLog.compartment_number == comp_num))
+
+        if device_assigned:
+            query = query.where(MedicineLog.device_name == device_assigned)  # Filter by device_assigned
+
+        logs = query.all()
 
         taken_logs = [log for log in logs if log.action == "taken"]
         refill_logs = [log for log in logs if log.action == "refill"]
@@ -1005,6 +1209,7 @@ def get_log_summary(session: Session = Depends(get_session)):
         })
 
     return summary
+
 
 @app.get("/logs/last-actions")
 def get_last_actions(session: Session = Depends(get_session)):
@@ -1232,45 +1437,68 @@ from random import random
 
 #     return summary
 
-
 @app.get("/logs/correct")
-def get_correctly_taken_logs(session: Session = Depends(get_session)):
-    logs = session.exec(
+def get_correctly_taken_logs(session: Session = Depends(get_session), device_assigned: Optional[str] = None):
+    """
+    Fetch correctly taken medicine logs (not late) with an optional device filter.
+    """
+    query = session.exec(
         select(MedicineLog).where(
             MedicineLog.action == "taken",
             MedicineLog.is_late == False
         )
-    ).all()
-    return logs
+    )
+    
+    if device_assigned:
+        query = query.where(MedicineLog.device_name == device_assigned)  # Filter by device_assigned
+    
+    return query.all()
+
 @app.get("/logs/late")
-def get_late_logs(session: Session = Depends(get_session)):
-    logs = session.exec(
+def get_late_logs(session: Session = Depends(get_session), device_assigned: Optional[str] = None):
+    """
+    Fetch late medicine logs (taken but late) with an optional device filter.
+    """
+    query = session.exec(
         select(MedicineLog).where(
             MedicineLog.action == "taken",
             MedicineLog.is_late == True
         )
-    ).all()
-    return logs
-
+    )
+    
+    if device_assigned:
+        query = query.where(MedicineLog.device_name == device_assigned)  # Filter by device_assigned
+    
+    return query.all()
 
 @app.get("/logs/missed")
-def get_missed_logs(session: Session = Depends(get_session)):
-    logs = session.exec(
+def get_missed_logs(session: Session = Depends(get_session), device_assigned: Optional[str] = None):
+    """
+    Fetch missed medicine logs with an optional device filter.
+    """
+    query = session.exec(
         select(MedicineLog).where(
             MedicineLog.action == "missed"
         )
-    ).all()
-    return logs
-
-
+    )
+    
+    if device_assigned:
+        query = query.where(MedicineLog.device_name == device_assigned)  # Filter by device_assigned
+    
+    return query.all()
 
 @app.get("/logs/daily-status")
-def get_daily_status(session: Session = Depends(get_session)):
-    today = datetime.utcnow().date()
+def get_daily_status(session: Session = Depends(get_session), device_assigned: Optional[str] = None):
+    today = datetime.now(ZoneInfo("Europe/Rome")).date()
+
     compartments = session.exec(select(Compartment)).all()
     status = []
 
     for comp in compartments:
+        # Filter by device_assigned if provided
+        if device_assigned and comp.device_assigned != device_assigned:
+            continue
+
         logs = session.exec(
             select(MedicineLog).where(
                 MedicineLog.compartment_number == comp.compartment_number,
@@ -1300,18 +1528,32 @@ def get_daily_status(session: Session = Depends(get_session)):
 
     return status
 
+
 @app.get("/logs/aderenza-oggi")
-def adherence_by_compartment(session: Session = Depends(get_session)):
+def adherence_by_compartment(session: Session = Depends(get_session), device_assigned: Optional[str] = None):
     today = datetime.now(ZoneInfo("Europe/Rome")).date()
     result = []
 
     for comp_num in [1, 2, 3]:
-        logs = session.exec(
+        # Fetch compartment based on the compartment number
+        comp = session.execute(
+            select(Compartment).where(Compartment.compartment_number == comp_num)
+        ).scalars().first()
+
+        if not comp:
+            continue
+
+        # If device_assigned is provided, filter compartments based on that
+        if device_assigned and comp.device_assigned != device_assigned:
+            continue
+
+        # Get logs for the current day
+        logs = session.execute(
             select(MedicineLog).where(
                 MedicineLog.compartment_number == comp_num,
                 MedicineLog.scheduled_date == today
             )
-        ).all()
+        ).scalars().all()
 
         expected = len([log for log in logs if log.action in ["scheduled", "missed", "taken"]])
         taken = len([log for log in logs if log.action == "taken"])
@@ -1327,21 +1569,34 @@ def adherence_by_compartment(session: Session = Depends(get_session)):
     return result
 
 @app.get("/logs/ritardi-medi")
-def average_delay(session: Session = Depends(get_session)):
+def average_delay(session: Session = Depends(get_session), device_assigned: Optional[str] = None):
     delays = []
 
-    logs = session.exec(
+    logs = session.execute(
         select(MedicineLog).where(
             MedicineLog.action == "taken",
             MedicineLog.scheduled_time != None,
             MedicineLog.scheduled_date != None,
             MedicineLog.taken_at != None
         )
-    ).all()
+    ).scalars().all()
 
     for log in logs:
+        # Fetch compartment for each log's compartment number
+        comp = session.execute(
+            select(Compartment).where(Compartment.compartment_number == log.compartment_number)
+        ).scalars().first()
+
+        if not comp:
+            continue
+
+        # If device_assigned is provided, filter compartments based on that
+        if device_assigned and comp.device_assigned != device_assigned:
+            continue
+
+        # Calculate delay
         sched_dt = datetime.combine(log.scheduled_date, log.scheduled_time)
-        delay = (log.taken_at - sched_dt).total_seconds() / 60  # in minuti
+        delay = (log.taken_at - sched_dt).total_seconds() / 60  # in minutes
         delays.append(delay)
 
     if delays:
@@ -1421,3 +1676,81 @@ async def test_reset_midnight():
     """
     await reset_compartments_midnight_async()
     return {"message": "✅ Reset simulato eseguito con successo."}
+
+
+@app.get("/logs/daily-status/everyday")
+def get_everyday_daily_status(session: Session = Depends(get_session), device_assigned: Optional[str] = None):
+    now = datetime.now(ZoneInfo("Europe/Rome"))
+    today = now.date()
+
+    week_start_date = today - timedelta(days=7)
+
+    compartments = session.exec(select(Compartment)).all()
+    status_by_date = defaultdict(list)
+
+    for comp in compartments:
+        # Filter by device_assigned if provided
+        if device_assigned and comp.device_assigned != device_assigned:
+            continue
+
+        logs = session.exec(
+            select(MedicineLog).where(
+                MedicineLog.compartment_number == comp.compartment_number,
+                MedicineLog.scheduled_date >= week_start_date,  # Logs from the last 7 days
+                MedicineLog.scheduled_date <= today  # Up to today
+            )
+        ).all()
+
+        log_map = {
+            log.scheduled_time: log.action + (" (late)" if log.is_late else "")
+            for log in logs
+        }
+
+        for date in range(7): 
+            date_to_check = today - timedelta(days=date)
+            if date_to_check in [log.scheduled_date for log in logs]:
+
+                if comp.to_be_repeated:
+                    status_by_date[date_to_check].append({
+                        "compartment": comp.compartment_number,
+                        "medicine": comp.medicine_name,
+                        "total_to_take": len([t for t in [comp.morning_time, comp.afternoon_time, comp.evening_time] if t]),
+                        "morning": log_map.get(comp.morning_time, "not scheduled"),
+                        "afternoon": log_map.get(comp.afternoon_time, "not scheduled"),
+                        "evening": log_map.get(comp.evening_time, "not scheduled")
+                    })
+                else:
+                    status_by_date[date_to_check].append({
+                        "compartment": comp.compartment_number,
+                        "medicine": comp.medicine_name,
+                        "total_to_take": 1,
+                        "scheduled_time": comp.time_if_not_repeated,
+                        "status": log_map.get(comp.time_if_not_repeated, "not scheduled")
+                    })
+
+    return [{"date": str(date), "status": status} for date, status in status_by_date.items()]
+
+
+@app.get("/logs/most-forgotten-medicine")
+def most_forgotten_medicine(session: Session = Depends(get_session), device_assigned: Optional[str] = None):
+    # Query for missed logs
+    missed_logs = session.exec(
+        select(MedicineLog).where(MedicineLog.action == "missed")
+    ).all()
+
+    # Filter missed logs by device_assigned if provided
+    if device_assigned:
+        missed_logs = [log for log in missed_logs if log.device_name == device_assigned]
+
+    # Create a Counter to count missed medicines
+    missed_count = Counter(log.medicine_name for log in missed_logs)
+
+    # Get the most forgotten medicine
+    if missed_count:
+        most_forgotten_medicine, count = missed_count.most_common(1)[0]
+        return {
+            "most_forgotten_medicine": most_forgotten_medicine,
+            "missed_count": count
+        }
+    else:
+        return {"message": "No missed medicines found."}

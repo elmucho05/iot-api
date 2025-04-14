@@ -48,7 +48,7 @@
   "number_of_medicines": 15,
   "to_be_repeated": true,
   "morning_time": "08:00:00",
-  "afternoon_time": "14:00:00",
+  "afternoon_time": "17:20:00",
   "evening_time": "20:00:00",
   "time_if_not_repeated": null
 }
@@ -65,11 +65,25 @@
 }
 [
   {
+    "id":"0FVR85Z1G3J4E6EBAKZ5X4928R",
+    "value":"1",
+    "feed_id":3038793,
+    "feed_name":"comp1-taken",
+    "feed_key":"comp1-taken",
+    "location":{"lat":null,"lon":null,"ele":null},
+    "created_at":"2025-04-14T15:06:25Z",
+    "updated_at":"2025-04-14T15:06:25Z",
+    "expiration":1747235185
+  }
+]
+
+[
+  {
     "value": "1",
-    "feed_name": "comp1-taken",
-    "feed_key": "comp1-taken",
-    "created_at": "2025-04-08T18:05:00Z",
-    "updated_at": "2025-04-08T18:05:00Z",
+    "feed_name": "device1-failed",
+    "feed_key": "device1-failed",
+    "created_at": "2025-04-14T16:05:00Z",
+    "updated_at": "2025-04-14T16:05:00Z",
     "expiration": 1746554036,
     "id": "test123",
     "feed_id": 9999,
@@ -82,14 +96,13 @@
 ]
 
 
-
 ############ bulk-createcompartment
 
 [
   {
     "compartment_number": 1,
     "medicine_name": "Paracetamolo",
-    "number_of_medicines": 6,
+    "number_of_medicines": 15,
     "to_be_repeated": true,
     "morning_time": "08:00:00",
     "afternoon_time": "14:00:00",
@@ -108,11 +121,11 @@
   },
   {
     "compartment_number": 3,
-    "medicine_name": "Aspirina",
+    "medicine_name": "OKI",
     "number_of_medicines": 8,
     "to_be_repeated": true,
     "morning_time": "07:30:00",
-    "afternoon_time": null,
+    "afternoon_time": "14:30:00",
     "evening_time": "21:00:00",
     "time_if_not_repeated": null
   }
