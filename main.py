@@ -579,7 +579,7 @@ def update_compartment(compartment_number: int, compartment_update: CompartmentU
         select(MedicineLog).where(
             MedicineLog.compartment_number == compartment.compartment_number,
             MedicineLog.medicine_name == original_name,
-            MedicineLog.scheduled_date == datetime.utcnow().date()
+            MedicineLog.scheduled_date == datetime.now(ZoneInfo("Europe/Rome"))
         )
     ).all()
 
