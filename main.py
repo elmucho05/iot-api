@@ -231,7 +231,7 @@ async def periodic_check_loop():
             await check_scheduled_logs_async()
         except Exception as e:
             print(f"❌ Errore nel cron async: {e}")
-        await asyncio.sleep(30)  # ogni 5 minuti, 300 secondi / 60 = 5 minuti
+        await asyncio.sleep(60)  # ogni 5 minuti, 300 secondi / 60 = 5 minuti
 
 
 
